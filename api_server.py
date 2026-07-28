@@ -279,6 +279,116 @@ async def place_bracket(req: BracketOrderReq):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---------------------------------------------------------------------------
+# Session 3 — Portfolio
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/v1/portfolio/positions")
+async def portfolio_positions(config: BrokerConfig):
+    try:
+        broker, session = _broker_from_config(config)
+        result = broker.get_positions(session)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/portfolio/holdings")
+async def portfolio_holdings(config: BrokerConfig):
+    try:
+        broker, session = _broker_from_config(config)
+        result = broker.get_holdings(session)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ConvertPositionReq(BrokerConfig):
+    exchange: str
+    scrip_token: int
+    transaction_type: str
+    quantity: int
+    old_product_type: str
+    new_product_type: str
+    bo_order_id: Optional[str] = None
+
+
+@app.post("/api/v1/portfolio/convert")
+async def portfolio_convert(req: ConvertPositionReq):
+    try:
+        broker, session = _broker_from_config(req)
+        result = broker.convert_position(
+            session, req.exchange, req.scrip_token, req.transaction_type,
+            req.quantity, req.old_product_type, req.new_product_type,
+            bo_order_id=req.bo_order_id,
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class LtpReq(BrokerConfig):
+    exchange: str = "NSE"
+    trading_symbol: str
+    symbol_token: int
+
+
+@app.post("/api/v1/market/ltp")
+async def market_ltp(req: LtpReq):
+    try:
+        broker, session = _broker_from_config(req)
+        result = broker.get_ltp(session, req.exchange, req.trading_symbol, req.symbol_token)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class BulkLtpReq(BrokerConfig):
+    items: list
+
+
+@app.post("/api/v1/market/ltp/bulk")
+async def market_bulk_ltp(req: BulkLtpReq):
+    try:
+        broker, session = _broker_from_config(req)
+        result = broker.get_bulk_ltp(session, req.items)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# WebSocket
+# ---------------------------------------------------------------------------
+
+
+class WsConnectReq(BrokerConfig):
+    pass
+
+
+@app.post("/api/v1/ws/connect")
+async def ws_connect(req: WsConnectReq):
+    try:
+        broker, session = _broker_from_config(req)
+        ws_creds = broker.get_ws_credentials()
+        return {"status": "success", "data": ws_creds}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("api_server:app", host="0.0.0.0", port=port, reload=True)

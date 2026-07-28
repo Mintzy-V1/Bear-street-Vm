@@ -40,6 +40,7 @@ from bear_street_client.models.bracket_order import (
     MainLeg as BracketMainLeg, StoplossLeg as BracketStoplossLeg,
     ProfitLeg, FieldsModified,
 )
+from bear_street_client.models.position_conversion import PositionConversionRequest
 
 
 class BrokerConnector:
@@ -599,20 +600,108 @@ class BrokerConnector:
             return {"status": "error", "error": str(e)}
 
     # -------------------------------------------------------------------------
-    # STUBS — Session 3
+    # PORTFOLIO
     # -------------------------------------------------------------------------
+
+    def _normalize_position_row(self, row: dict) -> dict:
+        sym = (row.get("symbol") or "").upper()
+        if sym and not sym.endswith("-EQ"):
+            sym = f"{sym}-EQ"
+        return {
+            "exchange": row.get("exchange"),
+            "tradingsymbol": sym,
+            "producttype": (row.get("product_type") or "").upper(),
+            "transactiontype": row.get("transaction_type"),
+            "quantity": int(row.get("net_quantity") or 0),
+            "buyqty": int(row.get("buy_quantity") or 0),
+            "buyavgprice": float(row.get("avg_buy_price") or 0),
+            "sellqty": int(row.get("sell_quantity") or 0),
+            "sellavgprice": float(row.get("avg_sell_price") or 0),
+            "ltp": float(row.get("ltp") or 0),
+            "mtm": float(row.get("mtm") or 0),
+            "multiplier": int(row.get("multiplier") or 1),
+            "scrip_token": row.get("scrip_token"),
+        }
 
     def get_positions(self, session):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided."}
-        return {"status": "error", "error": "Not implemented (Session 3)"}
+        try:
+            resp = self._call_api(session["obj"].get_positions)
+            raw_data = resp.get("data") if isinstance(resp, dict) else []
+            if isinstance(raw_data, dict):
+                raw_data = [raw_data]
+            data = [self._normalize_position_row(r) for r in (raw_data or [])]
+            return {"status": "success", "raw": {"status": True, "data": data}}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
     def get_holdings(self, session):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided."}
-        return {"status": "error", "error": "Not implemented (Session 3)"}
+        try:
+            resp = self._call_api(session["obj"].get_holdings)
+            raw_data = resp.get("data") if isinstance(resp, dict) else []
+            if isinstance(raw_data, dict):
+                raw_data = [raw_data]
+            return {"status": "success", "raw": {"status": True, "data": raw_data}}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def convert_position(self, session, exchange, scrip_token, transaction_type,
+                         quantity, old_product_type, new_product_type, bo_order_id=None):
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided."}
+        try:
+            req = PositionConversionRequest(
+                exchange=exchange,
+                scrip_token=scrip_token,
+                transaction_type=transaction_type,
+                quantity=quantity,
+                old_product_type=old_product_type,
+                new_product_type=new_product_type,
+                bo_order_id=bo_order_id,
+            )
+            resp = self._call_api(session["obj"].convert_position, req)
+            return {"status": "success", "raw": resp}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def _get_ltp_map(self, session, items):
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided."}
+        try:
+            resp = self._call_api(session["obj"].get_bulk_ltp, items)
+            return {"status": "success", "raw": resp}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
     def get_ltp(self, session, exchange, trading_symbol, symbol_token):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided."}
-        return {"status": "error", "error": "Not implemented (Session 3)"}
+        try:
+            resp = self._call_api(session["obj"].get_ltp, exchange, symbol_token)
+            return {"status": "success", "raw": resp}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def get_bulk_ltp(self, session, items):
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided."}
+        try:
+            resp = self._call_api(session["obj"].get_bulk_ltp, items)
+            return {"status": "success", "raw": resp}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}

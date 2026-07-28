@@ -8,6 +8,7 @@ import json
 from bear_street_client.models.login import LoginData, LoginResponse
 from bear_street_client.models.balance import BalanceData, BalanceResponse
 from bear_street_client.models.user_profile import UserProfileData, UserProfileResponse
+from bear_street_client.models.position_conversion import PositionConversionRequest, PositionConversionResponse
 
 from bear_street_client.exceptions import (
     BearStreetAPIError,
@@ -214,6 +215,40 @@ class BearStreetClient:
         if self.debug:
             print(f"[ORDER HISTORY] GET /transactional/v1/orders/{order_id}")
         response = self._get(f"transactional/v1/orders/{order_id}")
+        return response
+
+    # -------------------------------------------------------------------------
+    # PORTFOLIO ENDPOINTS
+    # -------------------------------------------------------------------------
+
+    def get_positions(self):
+        if self.debug:
+            print("[POSITIONS] GET /portfolio/v1/positions")
+        response = self._get("portfolio/v1/positions")
+        return response
+
+    def get_holdings(self):
+        if self.debug:
+            print("[HOLDINGS] GET /portfolio/v1/holdings")
+        response = self._get("portfolio/v1/holdings")
+        return response
+
+    def convert_position(self, req: PositionConversionRequest):
+        if self.debug:
+            print(f"[CONVERT] PUT /portfolio/v1/positions/convert")
+        response = self._put("portfolio/v1/positions/convert", payload=req.get_dict())
+        return response
+
+    def get_ltp(self, exchange, symbol_token):
+        if self.debug:
+            print(f"[LTP] GET /marketdata/v1/ltp/{exchange}/{symbol_token}")
+        response = self._get(f"marketdata/v1/ltp/{exchange}/{symbol_token}")
+        return response
+
+    def get_bulk_ltp(self, items):
+        if self.debug:
+            print(f"[BULK LTP] POST /marketdata/v1/ltp items={len(items)}")
+        response = self._post("marketdata/v1/ltp", payload={"items": items})
         return response
 
     def set_access_token(self, token):

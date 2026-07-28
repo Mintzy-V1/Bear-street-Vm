@@ -24,6 +24,7 @@ from .order_history import OrderHistoryResponse
 # Session 3: Portfolio
 from .positions import PositionsData, PositionsResponse
 from .holdings import HoldingsData, HoldingsResponse
+from .position_conversion import PositionConversionRequest, PositionConversionResponse
 
 __all__ = [
     "LoginData", "LoginRequest", "LoginResponse",
@@ -42,4 +43,5 @@ __all__ = [
     "OrderHistoryResponse",
     "PositionsData", "PositionsResponse",
     "HoldingsData", "HoldingsResponse",
+    "PositionConversionRequest", "PositionConversionResponse",
 ]

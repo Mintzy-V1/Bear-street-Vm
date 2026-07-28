@@ -142,6 +142,50 @@ def test_orders(broker, session):
     print("\n✓ Session 2 complete\n")
 
 
+def test_portfolio(broker, session):
+    print("=" * 60)
+    print("SESSION 3 — Portfolio & Market Data")
+    print("=" * 60)
+
+    print("\n>>> 1. Positions...")
+    pos = broker.get_positions(session)
+    print(f"    Status: {pos.get('status')}")
+    if pos.get("status") == "success":
+        items = pos.get("raw", {}).get("data", [])
+        print(f"    Positions: {len(items)}")
+        if items:
+            print(f"    First: {json.dumps(items[0], indent=2)[:200]}")
+    print(f"    ✓ Positions OK")
+
+    print("\n>>> 2. Holdings...")
+    hol = broker.get_holdings(session)
+    print(f"    Status: {hol.get('status')}")
+    if hol.get("status") == "success":
+        items = hol.get("raw", {}).get("data", [])
+        print(f"    Holdings: {len(items)}")
+    print(f"    ✓ Holdings OK")
+
+    print("\n>>> 3. LTP...")
+    ltp = broker.get_ltp(session, "NSE", "ACC", 22)
+    print(f"    Status: {ltp.get('status')}")
+    if ltp.get("status") == "success":
+        print(f"    LTP raw: {json.dumps(ltp.get('raw', {}), indent=2)[:200]}")
+    print(f"    ✓ LTP OK")
+
+    print("\n>>> 4. Bulk LTP...")
+    bltp = broker._get_ltp_map(session, [{"exchange": "NSE", "symbolToken": 22}])
+    print(f"    Status: {bltp.get('status')}")
+    print(f"    ✓ Bulk LTP OK")
+
+    print("\n>>> 5. WebSocket credentials...")
+    ws = broker.get_ws_credentials()
+    print(f"    auth_token: {str(ws.get('auth_token', ''))[:20]}...")
+    print(f"    broadcast_token: {str(ws.get('broadcast_token', ''))[:20]}...")
+    print(f"    ✓ WebSocket credentials OK")
+
+    print("\n✓ Session 3 complete\n")
+
+
 def main():
     if not all([API_KEY, USER_ID, PASSWORD, SECOND_AUTH]):
         print("ERROR: Set BEAR_STREET_API_KEY, BEAR_STREET_USER_ID, "
@@ -152,17 +196,23 @@ def main():
     from broker_bear_street import BrokerConnector
 
     test_orders_flag = "--order" in sys.argv
+    test_portfolio_flag = "--portfolio" in sys.argv
 
     broker = BrokerConnector()
     session = test_auth(broker)
 
     if test_orders_flag:
-        # Re-login after logout in test_auth
         broker2 = BrokerConnector()
         session2 = broker2.get_session()
         test_orders(broker2, session2)
-    else:
-        print('Pass --order to run order tests (requires a running API server).')
+
+    if test_portfolio_flag:
+        broker3 = BrokerConnector()
+        session3 = broker3.get_session()
+        test_portfolio(broker3, session3)
+
+    if not test_orders_flag and not test_portfolio_flag:
+        print('Pass --order and/or --portfolio to run those tests.')
 
 
 if __name__ == "__main__":
