@@ -2,6 +2,7 @@
 from .login import LoginData, LoginRequest, LoginResponse
 from .logout import LogoutData
 from .balance import BalanceData, BalanceResponse
+from .user_profile import UserProfileData, UserProfileResponse
 
 # Session 2: Orders
 from .new_order import NewOrderData, NewOrderResponse
@@ -16,6 +17,7 @@ __all__ = [
     "LoginData", "LoginRequest", "LoginResponse",
     "LogoutData",
     "BalanceData", "BalanceResponse",
+    "UserProfileData", "UserProfileResponse",
     "NewOrderData", "NewOrderResponse",
     "ModifyOrderData", "ModifyOrderResponse",
     "CancelOrderData", "CancelOrderResponse",

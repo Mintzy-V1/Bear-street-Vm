@@ -5,9 +5,9 @@ from dotenv import load_dotenv, set_key, get_key
 import os
 import json
 
-from bear_street_client.models.login import LoginRequest, LoginData, LoginResponse
-from bear_street_client.models.logout import LogoutData
+from bear_street_client.models.login import LoginData, LoginResponse
 from bear_street_client.models.balance import BalanceData, BalanceResponse
+from bear_street_client.models.user_profile import UserProfileData, UserProfileResponse
 
 from bear_street_client.exceptions import (
     BearStreetAPIError,
@@ -18,6 +18,7 @@ from bear_street_client.exceptions import (
 
 
 class BearStreetClient:
+
     def __init__(self, api_key, user_id, password, second_auth, source="WEBAPI",
                  base_url=None, debug=False, timeout=10, env_file=".env"):
         self.env_file = env_file
@@ -58,6 +59,9 @@ class BearStreetClient:
             "source": self.source,
         }
 
+        if self.debug:
+            print(f"[LOGIN] POST /authentication/v1/user/session user_id={self.user_id}")
+
         response = self._post("authentication/v1/user/session", payload=payload)
 
         if not response or "data" not in response:
@@ -73,7 +77,10 @@ class BearStreetClient:
         self.broadcast_token = data.get("broadcast_access_token")
         self.headers["Authorization"] = f"Bearer {self.token}"
 
-        self.__save_token_to_env(self.token)
+        self.__save_token_to_env(self.token, self.broadcast_token)
+
+        if self.debug:
+            print(f"[LOGIN] Success. Token={self.token[:20]}... Broadcast={self.broadcast_token[:20] if self.broadcast_token else 'N/A'}...")
 
         return LoginResponse(
             status=response.get("status"),
@@ -83,21 +90,28 @@ class BearStreetClient:
         )
 
     def logout(self):
+        if self.debug:
+            print("[LOGOUT] DELETE /authentication/v1/user/session")
+
         response = self._delete("authentication/v1/user/session")
 
         set_key(self.env_file, "BEAR_STREET_TOKEN", "")
         set_key(self.env_file, "BEAR_STREET_TOKEN_EXPIRY", "")
+        set_key(self.env_file, "BEAR_STREET_BROADCAST_TOKEN", "")
 
         self.token = None
         self.broadcast_token = None
         self.headers.pop("Authorization", None)
 
         if self.debug:
-            print("Logged out and removed token from env file")
+            print("[LOGOUT] Done, token cleared from env")
 
         return response
 
     def get_balance(self):
+        if self.debug:
+            print("[BALANCE] GET /authentication/v1/user/balance")
+
         response = self._get("authentication/v1/user/balance")
         data = BalanceData(**response.get("data", {})) if response.get("data") else None
         return BalanceResponse(
@@ -106,6 +120,23 @@ class BearStreetClient:
             message=response.get("message"),
             data=data,
         )
+
+    def get_user_profile(self):
+        if self.debug:
+            print("[USER PROFILE] GET /authentication/v1/user/profile")
+
+        response = self._get("authentication/v1/user/profile")
+        data = UserProfileData(**response.get("data", {})) if response.get("data") else None
+        return UserProfileResponse(
+            status=response.get("status"),
+            code=response.get("code"),
+            message=response.get("message"),
+            data=data,
+        )
+
+    def set_access_token(self, token):
+        self.token = token
+        self.headers["Authorization"] = f"Bearer {token}"
 
     def _get(self, endpoint, params=None):
         url = f"{self.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
@@ -129,7 +160,7 @@ class BearStreetClient:
         )
 
         if self.debug:
-            print(f"[{method}] {url} -> {response.status_code}")
+            print(f"[HTTP] {method} {url} -> {response.status_code}")
 
         try:
             response_json = response.json() if response.text else None
@@ -160,6 +191,19 @@ class BearStreetClient:
                 f"Not found: {url}",
                 response_message=response_json.get("message"),
             )
+        elif response.status_code == 405:
+            raise BearStreetInvalidResponseError(
+                f"Method not allowed for {url}",
+                status_code=405,
+                response_message=response_json.get("message"),
+            )
+        elif response.status_code == 429:
+            raise BearStreetAPIError(
+                f"Rate limit exceeded for {url}",
+                status_code=429,
+                response_message=response_json.get("message", "Too Many Requests"),
+                response_data=response_json.get("data", {}),
+            )
         elif response.status_code >= 500:
             raise BearStreetAPIError(
                 f"Server error for {url}",
@@ -182,15 +226,18 @@ class BearStreetClient:
             if datetime.now() + timedelta(minutes=5) < expiry:
                 self.token = token
                 self.headers["Authorization"] = f"Bearer {self.token}"
+                self.broadcast_token = get_key(self.env_file, "BEAR_STREET_BROADCAST_TOKEN")
                 return True
         except (ValueError, TypeError):
             pass
         return False
 
-    def __save_token_to_env(self, token, expiry_hours=24):
+    def __save_token_to_env(self, token, broadcast_token=None, expiry_hours=24):
         expiry = datetime.now() + timedelta(hours=expiry_hours)
         set_key(self.env_file, "BEAR_STREET_TOKEN", token)
         set_key(self.env_file, "BEAR_STREET_TOKEN_EXPIRY", expiry.isoformat())
+        if broadcast_token:
+            set_key(self.env_file, "BEAR_STREET_BROADCAST_TOKEN", broadcast_token)
 
         if self.debug:
             print(f"Token saved to {self.env_file}, expires at {expiry}")

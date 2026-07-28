@@ -3,6 +3,7 @@ import time
 import json
 from datetime import datetime
 from pathlib import Path
+import sys
 
 from broker_factory import BROKER_BEAR_STREET, DEFAULT_BEAR_STREET_BASE_URL
 
@@ -19,7 +20,6 @@ def _ensure_sdk_path():
         p = Path(sdk_path)
         if (p / "bear_street_client").is_dir() or (p.name == "bear_street_client" and p.is_dir()):
             root = str(p if (p / "bear_street_client").is_dir() else p.parent)
-            import sys
             if root not in sys.path:
                 sys.path.insert(0, root)
             return
@@ -46,6 +46,7 @@ class BrokerConnector:
         self.access_token = None
         self.broadcast_access_token = None
         self.user = None
+        self.debug = os.getenv("BEAR_STREET_DEBUG", "").lower() in ("1", "true", "yes")
 
     def _build_client(self):
         if not self.api_key or not self.user_id or not self.password or not self.second_auth:
@@ -83,15 +84,14 @@ class BrokerConnector:
         except Exception as ex:
             raise RuntimeError(f"Bear Street login failed: {ex}") from ex
 
-    def restore_session(self, broker_session):
+    def restore_session(self, broker_session: dict):
         token = (broker_session or {}).get("token") or ""
         if token.startswith("Bearer "):
             token = token.replace("Bearer ", "", 1)
 
         self.obj = self._build_client()
         if token:
-            self.obj.token = token
-            self.obj.headers["Authorization"] = f"Bearer {token}"
+            self.obj.set_access_token(token)
             self.access_token = token
         else:
             return self._create_session()
@@ -101,8 +101,11 @@ class BrokerConnector:
         try:
             self.obj.get_balance()
         except BearStreetAuthError:
+            if self.debug:
+                print("[RESTORE] Token expired, re-logging in")
             login_resp = self.obj.login(get_new_token=True)
             self.access_token = self.obj.token
+            self.broadcast_access_token = self.obj.broadcast_token
             if not self.access_token:
                 raise RuntimeError(f"Bear Street token refresh failed: {login_resp.message}")
 
@@ -161,12 +164,30 @@ class BrokerConnector:
                     time.sleep(wait)
                     continue
                 raise
+            except Exception as e:
+                raise RuntimeError(f"API call failed: {e}")
 
     def get_account_balance(self, session):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided."}
         try:
             resp = self._call_api(session["obj"].get_balance)
+            return {
+                "status": "success",
+                "free_cash": float(resp.data.equity.get("cash", 0)) if resp and resp.data and resp.data.equity else 0,
+                "data": resp.get_dict() if hasattr(resp, "get_dict") else {},
+                "source": "BEAR_STREET_SDK",
+            }
+        except RuntimeError:
+            raise
+        except Exception as ex:
+            return {"status": "error", "error": str(ex), "source": "BEAR_STREET_SDK"}
+
+    def get_user_profile(self, session):
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided."}
+        try:
+            resp = self._call_api(session["obj"].get_user_profile)
             return {"status": "success", "raw": resp.get_dict() if hasattr(resp, "get_dict") else {}}
         except RuntimeError:
             raise
@@ -179,47 +200,39 @@ class BrokerConnector:
                     trigger_price=None, wait_for_confirmation=True, **kwargs):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided.", "filled": False}
-        # TODO Session 2: implement full order placement
-        return {"status": "error", "error": "Not implemented", "filled": False}
+        return {"status": "error", "error": "Not implemented (Session 2)", "filled": False}
 
     def modify_order(self, session, order_id, new_price=None, new_qty=None, **kwargs):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided."}
-        # TODO Session 2
-        return {"status": "error", "error": "Not implemented"}
+        return {"status": "error", "error": "Not implemented (Session 2)"}
 
     def cancel_order(self, session, order_id, variety="NORMAL"):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided."}
-        # TODO Session 2
-        return {"status": "error", "error": "Not implemented"}
+        return {"status": "error", "error": "Not implemented (Session 2)"}
 
     def get_order_book(self, session):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided."}
-        # TODO Session 2
-        return {"status": "error", "error": "Not implemented"}
+        return {"status": "error", "error": "Not implemented (Session 2)"}
 
     def get_trade_book(self, session):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided."}
-        # TODO Session 2
-        return {"status": "error", "error": "Not implemented"}
+        return {"status": "error", "error": "Not implemented (Session 2)"}
 
     def get_positions(self, session):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided."}
-        # TODO Session 3
-        return {"status": "error", "error": "Not implemented"}
+        return {"status": "error", "error": "Not implemented (Session 3)"}
 
     def get_holdings(self, session):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided."}
-        # TODO Session 3
-        return {"status": "error", "error": "Not implemented"}
+        return {"status": "error", "error": "Not implemented (Session 3)"}
 
     def get_ltp(self, session, exchange, trading_symbol, symbol_token):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided."}
-        # TODO Session 3
-        return {"status": "error", "error": "Not implemented"}
+        return {"status": "error", "error": "Not implemented (Session 3)"}

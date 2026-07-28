@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 import uvicorn
 import os
@@ -31,38 +31,107 @@ app.add_middleware(
 
 BASE_DIR = Path(__file__).resolve().parent
 LOGS_DIR = BASE_DIR / "logs"
-
 logger = logging.getLogger(__name__)
-
 SECRET = os.getenv("SECRET", "dev-secret")
+
+
+class BrokerConfig(BaseModel):
+    api_key: str
+    user_id: str
+    password: str
+    second_auth: str
+    source: str = "WEBAPI"
+    base_url: Optional[str] = None
 
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "broker": "bear_street"}
+    return {"status": "success", "message": "Bear Street API Server running", "version": "1.0.0"}
 
 
-@app.post("/api/login")
-async def login(config: Dict[str, Any], x_plugin_api_key: str = Header(default=None)):
+@app.post("/api/v1/login")
+async def login(config: BrokerConfig, x_api_key: str = Header(default=None)):
     try:
-        broker, session = connect_broker(config)
+        broker, session = connect_broker({
+            "broker_type": BROKER_BEAR_STREET,
+            "api_key": config.api_key,
+            "user_id": config.user_id,
+            "password": config.password,
+            "second_auth": config.second_auth,
+            "source": config.source,
+            "base_url": config.base_url or DEFAULT_BEAR_STREET_BASE_URL,
+        })
         return {
             "status": "success",
+            "message": "Logged in successfully",
             "data": {
                 "user": session.get("user"),
-                "token": session.get("token"),
+                "access_token": session.get("token"),
+                "broadcast_access_token": session.get("broadcast_token"),
             },
         }
     except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
+        raise HTTPException(status_code=401, detail=f"Login failed: {str(e)}")
 
 
-@app.post("/api/balance")
-async def balance(config: Dict[str, Any], x_plugin_api_key: str = Header(default=None)):
+@app.post("/api/v1/logout")
+async def logout(config: BrokerConfig, x_api_key: str = Header(default=None)):
     try:
-        broker, session = connect_broker(config)
+        broker, session = connect_broker({
+            "broker_type": BROKER_BEAR_STREET,
+            "api_key": config.api_key,
+            "user_id": config.user_id,
+            "password": config.password,
+            "second_auth": config.second_auth,
+            "source": config.source,
+            "base_url": config.base_url or DEFAULT_BEAR_STREET_BASE_URL,
+        })
+        result = broker.obj.logout() if broker.obj else {}
+        return {"status": "success", "message": "Logged out", "data": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/balance")
+async def balance(config: BrokerConfig, x_api_key: str = Header(default=None)):
+    try:
+        broker, session = connect_broker({
+            "broker_type": BROKER_BEAR_STREET,
+            "api_key": config.api_key,
+            "user_id": config.user_id,
+            "password": config.password,
+            "second_auth": config.second_auth,
+            "source": config.source,
+            "base_url": config.base_url or DEFAULT_BEAR_STREET_BASE_URL,
+        })
         result = broker.get_account_balance(session)
-        return result
+        if result.get("status") == "error":
+            raise HTTPException(status_code=500, detail=result.get("error"))
+        return {"status": "success", "data": result.get("data", {})}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/profile")
+async def profile(config: BrokerConfig, x_api_key: str = Header(default=None)):
+    try:
+        broker, session = connect_broker({
+            "broker_type": BROKER_BEAR_STREET,
+            "api_key": config.api_key,
+            "user_id": config.user_id,
+            "password": config.password,
+            "second_auth": config.second_auth,
+            "source": config.source,
+            "base_url": config.base_url or DEFAULT_BEAR_STREET_BASE_URL,
+        })
+        result = broker.get_user_profile(session)
+        if result.get("status") == "error":
+            raise HTTPException(status_code=500, detail=result.get("error"))
+        return {"status": "success", "data": result.get("raw", {})}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
