@@ -29,6 +29,17 @@ _ensure_sdk_path()
 
 from bear_street_client import BearStreetClient
 from bear_street_client.exceptions import BearStreetAuthError, BearStreetAPIError
+from bear_street_client.models.new_order import ScripInfo, NewOrderRequest
+from bear_street_client.models.modify_order import ModifyOrderRequest
+from bear_street_client.models.cover_order import (
+    CoverOrderRequest, CoverOrderRequestForModify,
+    MainLeg as CoverMainLeg, StoplossLeg as CoverStoplossLeg,
+)
+from bear_street_client.models.bracket_order import (
+    BracketOrderRequest, BracketOrderRequestForModify,
+    MainLeg as BracketMainLeg, StoplossLeg as BracketStoplossLeg,
+    ProfitLeg, FieldsModified,
+)
 
 
 class BrokerConnector:
@@ -67,12 +78,10 @@ class BrokerConnector:
             login_resp = self.obj.login(get_new_token=True)
             if not self.obj.token:
                 raise RuntimeError(f"Bear Street login failed: {login_resp.message}")
-
             self.access_token = self.obj.token
             self.broadcast_access_token = self.obj.broadcast_token
             self.user = self.user_id
             print("Bear Street account linked successfully.")
-
             return {
                 "user": self.user,
                 "token": self.access_token,
@@ -88,16 +97,13 @@ class BrokerConnector:
         token = (broker_session or {}).get("token") or ""
         if token.startswith("Bearer "):
             token = token.replace("Bearer ", "", 1)
-
         self.obj = self._build_client()
         if token:
             self.obj.set_access_token(token)
             self.access_token = token
         else:
             return self._create_session()
-
         self.user = self.user_id
-
         try:
             self.obj.get_balance()
         except BearStreetAuthError:
@@ -108,7 +114,6 @@ class BrokerConnector:
             self.broadcast_access_token = self.obj.broadcast_token
             if not self.access_token:
                 raise RuntimeError(f"Bear Street token refresh failed: {login_resp.message}")
-
         return {
             "user": self.user,
             "token": self.access_token,
@@ -167,6 +172,10 @@ class BrokerConnector:
             except Exception as e:
                 raise RuntimeError(f"API call failed: {e}")
 
+    # -------------------------------------------------------------------------
+    # ACCOUNT
+    # -------------------------------------------------------------------------
+
     def get_account_balance(self, session):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided."}
@@ -194,33 +203,404 @@ class BrokerConnector:
         except Exception as ex:
             return {"status": "error", "error": str(ex)}
 
-    def place_order(self, session, symbol, side, qty=None, quantity=None, price=None,
-                    order_type="MARKET", product_type="INTRADAY", exchange="NSE",
-                    variety="NORMAL", lot_based=False, stop_loss=None,
-                    trigger_price=None, wait_for_confirmation=True, **kwargs):
-        if not session or "obj" not in session:
-            return {"status": "error", "error": "No active session object provided.", "filled": False}
-        return {"status": "error", "error": "Not implemented (Session 2)", "filled": False}
+    # -------------------------------------------------------------------------
+    # ORDER BOOK / TRADE BOOK / ORDER HISTORY
+    # -------------------------------------------------------------------------
 
-    def modify_order(self, session, order_id, new_price=None, new_qty=None, **kwargs):
-        if not session or "obj" not in session:
-            return {"status": "error", "error": "No active session object provided."}
-        return {"status": "error", "error": "Not implemented (Session 2)"}
+    def _normalize_order_row(self, order_row: dict) -> dict:
+        status = (order_row.get("status") or "").upper()
+        if status in ("EXECUTED", "COMPLETE", "TRADED"):
+            orderstatus = "complete"
+        elif status in ("CANCELLED", "CANCELED"):
+            orderstatus = "cancelled"
+        elif status == "REJECTED":
+            orderstatus = "rejected"
+        else:
+            orderstatus = status.lower() or "open"
+        sym = (order_row.get("symbol") or "").upper()
+        if sym and not sym.endswith("-EQ"):
+            sym = f"{sym}-EQ"
+        return {
+            "orderid": order_row.get("order_id"),
+            "tradingsymbol": sym,
+            "orderstatus": orderstatus,
+            "averageprice": float(order_row.get("average_price") or 0),
+            "filledshares": int(order_row.get("traded_quantity") or 0),
+            "price": float(order_row.get("price") or 0),
+            "producttype": (order_row.get("product_type") or "").upper(),
+            "transactiontype": order_row.get("transaction_type"),
+            "text": order_row.get("rejection_reason") or "",
+            "exchange": order_row.get("exchange"),
+            "scrip_token": order_row.get("scrip_token"),
+            "order_identifier": order_row.get("order_identifier"),
+        }
 
-    def cancel_order(self, session, order_id, variety="NORMAL"):
-        if not session or "obj" not in session:
-            return {"status": "error", "error": "No active session object provided."}
-        return {"status": "error", "error": "Not implemented (Session 2)"}
+    def _normalize_trade_row(self, trade_row: dict) -> dict:
+        sym = (trade_row.get("symbol") or "").upper()
+        if sym and not sym.endswith("-EQ"):
+            sym = f"{sym}-EQ"
+        return {
+            "orderid": trade_row.get("order_id"),
+            "tradingsymbol": sym,
+            "trade_no": trade_row.get("trade_no"),
+            "exchange_order_no": trade_row.get("exchange_order_no"),
+            "transactiontype": trade_row.get("transaction_type"),
+            "producttype": (trade_row.get("product_type") or "").upper(),
+            "trade_quantity": int(trade_row.get("trade_quantity") or 0),
+            "trade_price": float(trade_row.get("trade_price") or 0),
+            "exchange": trade_row.get("exchange"),
+            "trade_timestamp": trade_row.get("trade_timestamp"),
+            "order_identifier": trade_row.get("order_identifier"),
+        }
 
     def get_order_book(self, session):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided."}
-        return {"status": "error", "error": "Not implemented (Session 2)"}
+        try:
+            resp = self._call_api(session["obj"].get_order_book, 1, 500)
+            raw_data = resp.get("data") if isinstance(resp, dict) else []
+            if isinstance(raw_data, dict):
+                raw_data = [raw_data]
+            data = [self._normalize_order_row(r) for r in (raw_data or [])]
+            return {"status": "success", "raw": {"status": True, "data": data}}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
     def get_trade_book(self, session):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided."}
-        return {"status": "error", "error": "Not implemented (Session 2)"}
+        try:
+            resp = self._call_api(session["obj"].get_trade_book, 1, 500)
+            raw_data = resp.get("data") if isinstance(resp, dict) else []
+            if isinstance(raw_data, dict):
+                raw_data = [raw_data]
+            data = [self._normalize_trade_row(r) for r in (raw_data or [])]
+            return {"status": "success", "raw": {"status": True, "data": data}}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def get_order_status(self, session, order_id):
+        try:
+            book = self.get_order_book(session)
+            if book.get("status") != "success":
+                return {"status": "error", "error": book.get("error", "order book failed")}
+            for order in book.get("raw", {}).get("data", []):
+                if str(order.get("orderid")) == str(order_id):
+                    return order
+            return {"status": "error", "error": f"Order {order_id} not found"}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def _find_order_row(self, session, order_id):
+        book = self.get_order_book(session)
+        if book.get("status") != "success":
+            return None
+        for order in book.get("raw", {}).get("data", []):
+            if str(order.get("orderid")) == str(order_id):
+                return order
+        return None
+
+    def get_order_history(self, session, order_id):
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided."}
+        try:
+            resp = self._call_api(session["obj"].get_order_history, order_id)
+            return {"status": "success", "raw": resp if isinstance(resp, dict) else {}}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    # -------------------------------------------------------------------------
+    # ORDER CONFIRMATION POLLING
+    # -------------------------------------------------------------------------
+
+    def _wait_for_order_confirmation(self, session, order_id, max_wait_seconds=10, check_interval=1):
+        if not order_id:
+            return {"filled": False, "status": "NO_ORDER_ID", "message": "No order ID provided"}
+        elapsed = 0
+        while elapsed < max_wait_seconds:
+            try:
+                book = self.get_order_book(session)
+                if book.get("status") != "success":
+                    time.sleep(check_interval)
+                    elapsed += check_interval
+                    continue
+                for order in book.get("raw", {}).get("data", []):
+                    oid = str(order.get("orderid"))
+                    if oid != str(order_id):
+                        continue
+                    status = (order.get("orderstatus") or "").upper()
+                    avg_price = float(order.get("averageprice") or 0)
+                    if status in ("EXECUTED", "COMPLETE", "TRADED"):
+                        return {"filled": True, "status": status, "avg_price": avg_price,
+                                "message": f"Order {order_id} filled at {avg_price:.2f}"}
+                    if status in ("REJECTED", "CANCELLED", "FAILED"):
+                        return {"filled": False, "status": status, "avg_price": 0,
+                                "message": f"Order {order_id} {status.lower()}"}
+                time.sleep(check_interval)
+                elapsed += check_interval
+            except RuntimeError:
+                raise
+            except Exception as e:
+                if self.debug:
+                    print(f"[WARN] Order status check failed: {e}")
+                time.sleep(check_interval)
+                elapsed += check_interval
+        return {"filled": False, "status": "TIMEOUT", "avg_price": 0,
+                "message": f"Order {order_id} status check timed out after {max_wait_seconds}s"}
+
+    # -------------------------------------------------------------------------
+    # REGULAR ORDERS
+    # -------------------------------------------------------------------------
+
+    def place_order(self, session, symbol, side, qty=None, quantity=None, price=None,
+                    order_type="MARKET", product_type="INTRADAY", exchange="NSE",
+                    variety="NORMAL", lot_based=False, stop_loss=None,
+                    trigger_price=None, wait_for_confirmation=True, **kwargs):
+        qty = qty or quantity
+        if qty is None:
+            return {"status": "error", "error": "Missing quantity/qty argument", "filled": False}
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided.", "filled": False}
+
+        side_upper = side.upper().replace("_", "").replace(" ", "")
+        if side_upper in ("BUY", "LONG", "BUYCOVER", "COVER"):
+            api_side = "BUY"
+        elif side_upper in ("SELL", "SHORT", "SHORTSELL", "SELLSHORT"):
+            api_side = "SELL"
+        else:
+            return {"status": "error", "error": f"Invalid side: {side}", "filled": False}
+
+        bear_exchange = exchange
+        bear_product = product_type.upper()
+        is_market = order_type.upper() in ("MARKET", "RL-MKT")
+        bear_order_type = "RL-MKT" if is_market else "RL"
+        if stop_loss or trigger_price:
+            bear_order_type = "SL" if not is_market else "SL-MKT"
+        price_value = 0.0 if is_market else float(price or 0)
+        trigger_value = float(trigger_price or stop_loss or 0)
+
+        scrip = ScripInfo(exchange=bear_exchange, symbol=symbol)
+
+        req = NewOrderRequest(
+            scrip_info=scrip,
+            transaction_type=api_side,
+            product_type=bear_product,
+            order_type=bear_order_type,
+            quantity=int(qty),
+            price=price_value,
+            trigger_price=trigger_value if trigger_value > 0 else None,
+            validity=kwargs.get("validity", "DAY"),
+            order_identifier=kwargs.get("order_identifier"),
+        )
+
+        try:
+            print(f"[ORDER] Bear Street {api_side} {symbol} x {qty} @ {price_value} product={bear_product} type={bear_order_type}")
+            resp = self._call_api(session["obj"].place_order, req.get_dict())
+            order_id = None
+            if isinstance(resp, dict):
+                order_id = resp.get("order_id") or (resp.get("data") or {}).get("order_id")
+
+            if not order_id:
+                return {"status": "error", "error": "No order ID in response", "filled": False, "raw": resp}
+
+            if wait_for_confirmation:
+                confirmation = self._wait_for_order_confirmation(session, order_id)
+                if confirmation.get("filled"):
+                    return {"status": "success", "order_id": order_id, "filled": True,
+                            "avg_price": confirmation["avg_price"], "raw": resp}
+                return {"status": "error", "order_id": order_id, "filled": False,
+                        "error": confirmation["message"], "raw": resp}
+            return {"status": "success", "order_id": order_id, "filled": None, "raw": resp}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e), "filled": False}
+
+    def modify_order(self, session, order_id, new_price=None, new_qty=None, **kwargs):
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided."}
+        try:
+            row = self._find_order_row(session, order_id)
+            if not row:
+                return {"status": "error", "error": f"Order {order_id} not found in order book"}
+
+            traded_qty = int(row.get("filledshares") or 0)
+            exchange = row.get("exchange") or "NSE"
+            req = ModifyOrderRequest(
+                order_type=kwargs.get("order_type", row.get("orderstatus", "RL")),
+                quantity=int(new_qty or (traded_qty + 1)),
+                traded_quantity=traded_qty,
+                price=float(new_price or kwargs.get("price") or row.get("price") or 0),
+                trigger_price=float(kwargs.get("trigger_price") or 0) or None,
+                validity=kwargs.get("validity", "DAY"),
+            )
+            resp = self._call_api(session["obj"].modify_order, exchange, order_id, req.get_dict())
+            return {"status": "success", "raw": resp}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def cancel_order(self, session, order_id, variety="NORMAL"):
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided."}
+        try:
+            row = self._find_order_row(session, order_id)
+            exchange = (row or {}).get("exchange") or "NSE"
+            resp = self._call_api(session["obj"].cancel_order, exchange, order_id)
+            return {"status": "success", "raw": resp}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    # -------------------------------------------------------------------------
+    # COVER ORDERS
+    # -------------------------------------------------------------------------
+
+    def place_cover_order(self, session, symbol, side, qty, price=0,
+                          order_type="RL-MKT", exchange="NSE", **kwargs):
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided.", "filled": False}
+        try:
+            scrip = ScripInfo(exchange=exchange, symbol=symbol)
+            req = CoverOrderRequest(
+                scrip_info=scrip,
+                transaction_type=side.upper(),
+                main_leg=CoverMainLeg(order_type=order_type, quantity=int(qty), price=float(price)),
+                stoploss_leg=CoverStoplossLeg(legs=kwargs.get("stoploss_legs", [])),
+                order_identifier=kwargs.get("order_identifier"),
+            )
+            print(f"[COVER] Bear Street {side} {symbol} x {qty}")
+            resp = self._call_api(session["obj"].place_cover_order, req.get_dict())
+            return {"status": "success", "raw": resp}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def modify_cover_order(self, session, order_id, **kwargs):
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided."}
+        try:
+            row = self._find_order_row(session, order_id)
+            exchange = (row or {}).get("exchange") or "NSE"
+            req = CoverOrderRequestForModify(
+                main_leg=CoverMainLeg(
+                    order_type=kwargs.get("order_type", "RL-MKT"),
+                    quantity=int(kwargs.get("quantity", 0)),
+                    price=float(kwargs.get("price", 0)),
+                ) if kwargs.get("quantity") else None,
+                stoploss_leg=CoverStoplossLeg(legs=kwargs.get("stoploss_legs", [])),
+            )
+            resp = self._call_api(session["obj"].modify_cover_order, exchange, order_id, req.get_dict())
+            return {"status": "success", "raw": resp}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def cancel_cover_order(self, session, order_id):
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided."}
+        try:
+            row = self._find_order_row(session, order_id)
+            exchange = (row or {}).get("exchange") or "NSE"
+            resp = self._call_api(session["obj"].cancel_cover_order, exchange, order_id)
+            return {"status": "success", "raw": resp}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    # -------------------------------------------------------------------------
+    # BRACKET ORDERS
+    # -------------------------------------------------------------------------
+
+    def place_bracket_order(self, session, symbol, side, qty, price=0,
+                            trigger_price=None, exchange="NSE", **kwargs):
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided.", "filled": False}
+        try:
+            scrip = ScripInfo(exchange=exchange, symbol=symbol)
+            req = BracketOrderRequest(
+                scrip_info=scrip,
+                transaction_type=side.upper(),
+                main_leg=BracketMainLeg(
+                    order_type=kwargs.get("order_type", "RL"),
+                    quantity=int(qty),
+                    price=float(price),
+                    trigger_price=float(trigger_price or 0) or None,
+                ),
+                stoploss_leg=BracketStoplossLeg(
+                    legs=kwargs.get("stoploss_legs", {}),
+                    trail=kwargs.get("stoploss_trail", {}),
+                ),
+                profit_leg=ProfitLeg(legs=kwargs.get("profit_legs", [])),
+                order_identifier=kwargs.get("order_identifier"),
+            )
+            print(f"[BRACKET] Bear Street {side} {symbol} x {qty}")
+            resp = self._call_api(session["obj"].place_bracket_order, req.get_dict())
+            return {"status": "success", "raw": resp}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def modify_bracket_order(self, session, order_id, **kwargs):
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided."}
+        try:
+            row = self._find_order_row(session, order_id)
+            exchange = (row or {}).get("exchange") or "NSE"
+            req = BracketOrderRequestForModify(
+                main_leg=BracketMainLeg(
+                    order_type=kwargs.get("order_type", "RL"),
+                    quantity=int(kwargs.get("quantity", 0)),
+                    price=float(kwargs.get("price", 0)),
+                    trigger_price=float(kwargs.get("trigger_price", 0)) or None,
+                    traded_quantity=int(kwargs.get("traded_quantity", 0)),
+                ) if kwargs.get("quantity") else None,
+                stoploss_leg=BracketStoplossLeg(
+                    legs=kwargs.get("stoploss_legs", []),
+                    trail=kwargs.get("stoploss_trail", {}),
+                ),
+                profit_leg=ProfitLeg(legs=kwargs.get("profit_legs", [])),
+                fields_modified=FieldsModified(
+                    main_leg_price=kwargs.get("modify_main_price", False),
+                    main_leg_qty=kwargs.get("modify_main_qty", False),
+                    stoploss_leg_price=kwargs.get("modify_sl_price", False),
+                    stoploss_trail_price=kwargs.get("modify_sl_trail", False),
+                    profit_leg_price=kwargs.get("modify_profit_price", False),
+                ) if any(kwargs.get(k) for k in ("modify_main_price", "modify_main_qty", "modify_sl_price", "modify_sl_trail", "modify_profit_price")) else None,
+            )
+            resp = self._call_api(session["obj"].modify_bracket_order, exchange, order_id, req.get_dict())
+            return {"status": "success", "raw": resp}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def exit_bracket_order(self, session, order_id):
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided."}
+        try:
+            resp = self._call_api(session["obj"].exit_bracket_order, order_id)
+            return {"status": "success", "raw": resp}
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    # -------------------------------------------------------------------------
+    # STUBS — Session 3
+    # -------------------------------------------------------------------------
 
     def get_positions(self, session):
         if not session or "obj" not in session:

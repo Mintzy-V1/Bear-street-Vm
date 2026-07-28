@@ -134,6 +134,88 @@ class BearStreetClient:
             data=data,
         )
 
+    # -------------------------------------------------------------------------
+    # ORDER ENDPOINTS
+    # -------------------------------------------------------------------------
+
+    def place_order(self, order_details):
+        if self.debug:
+            print(f"[PLACE ORDER] POST /transactional/v1/orders/regular")
+        response = self._post("transactional/v1/orders/regular", payload=order_details)
+        return response
+
+    def modify_order(self, exchange, order_id, modify_details):
+        if self.debug:
+            print(f"[MODIFY ORDER] PUT /transactional/v1/orders/regular/{exchange}/{order_id}")
+        response = self._put(f"transactional/v1/orders/regular/{exchange}/{order_id}", payload=modify_details)
+        return response
+
+    def cancel_order(self, exchange, order_id):
+        if self.debug:
+            print(f"[CANCEL ORDER] DELETE /transactional/v1/orders/regular/{exchange}/{order_id}")
+        response = self._delete(f"transactional/v1/orders/regular/{exchange}/{order_id}")
+        return response
+
+    def place_cover_order(self, order_details):
+        if self.debug:
+            print("[PLACE COVER] POST /transactional/v1/orders/cover")
+        response = self._post("transactional/v1/orders/cover", payload=order_details)
+        return response
+
+    def modify_cover_order(self, exchange, order_id, modify_details):
+        if self.debug:
+            print(f"[MODIFY COVER] PUT /transactional/v1/orders/cover/{exchange}/{order_id}")
+        response = self._put(f"transactional/v1/orders/cover/{exchange}/{order_id}", payload=modify_details)
+        return response
+
+    def cancel_cover_order(self, exchange, order_id):
+        if self.debug:
+            print(f"[CANCEL COVER] DELETE /transactional/v1/orders/cover/{exchange}/{order_id}")
+        response = self._delete(f"transactional/v1/orders/cover/{exchange}/{order_id}")
+        return response
+
+    def place_bracket_order(self, order_details):
+        if self.debug:
+            print("[PLACE BRACKET] POST /transactional/v1/orders/bracket")
+        response = self._post("transactional/v1/orders/bracket", payload=order_details)
+        return response
+
+    def modify_bracket_order(self, exchange, order_id, modify_details):
+        if self.debug:
+            print(f"[MODIFY BRACKET] PUT /transactional/v1/orders/bracket/{exchange}/{order_id}")
+        response = self._put(f"transactional/v1/orders/bracket/{exchange}/{order_id}", payload=modify_details)
+        return response
+
+    def exit_bracket_order(self, order_id):
+        if self.debug:
+            print(f"[EXIT BRACKET] DELETE /transactional/v1/orders/bracket/{order_id}")
+        response = self._delete(f"transactional/v1/orders/bracket/{order_id}")
+        return response
+
+    def get_order_book(self, offset=1, limit=100, order_id=None):
+        if self.debug:
+            print(f"[ORDER BOOK] GET /transactional/v1/orders offset={offset} limit={limit}")
+        params = {"offset": offset, "limit": limit}
+        if order_id:
+            params["order_id"] = order_id
+        response = self._get("transactional/v1/orders", params=params)
+        return response
+
+    def get_trade_book(self, offset=1, limit=100, order_id=None):
+        if self.debug:
+            print(f"[TRADE BOOK] GET /transactional/v1/trades offset={offset} limit={limit}")
+        params = {"offset": offset, "limit": limit}
+        if order_id:
+            params["order_id"] = order_id
+        response = self._get("transactional/v1/trades", params=params)
+        return response
+
+    def get_order_history(self, order_id):
+        if self.debug:
+            print(f"[ORDER HISTORY] GET /transactional/v1/orders/{order_id}")
+        response = self._get(f"transactional/v1/orders/{order_id}")
+        return response
+
     def set_access_token(self, token):
         self.token = token
         self.headers["Authorization"] = f"Bearer {token}"

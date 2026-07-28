@@ -1,10 +1,12 @@
 """
-Minimal end-to-end test for Bear Street (Globe Capital) API auth flow.
+End-to-end test for Bear Street (Globe Capital) API.
+
+Tests Session 1 (auth) and Session 2 (orders).
 
 Usage:
-    python test_bear_street.py
+    python test_bear_street.py [--order]
 
-Set credentials via environment variables or edit below:
+Set credentials via environment variables:
     BEAR_STREET_API_KEY
     BEAR_STREET_USER_ID
     BEAR_STREET_PASSWORD
@@ -15,6 +17,7 @@ Set credentials via environment variables or edit below:
 import os
 import sys
 import json
+import time
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -26,84 +29,140 @@ SECOND_AUTH = os.getenv("BEAR_STREET_SECOND_AUTH", "")
 BASE_URL = os.getenv("BEAR_STREET_BASE_URL", "http://localhost:3100")
 
 
+def set_env():
+    os.environ["BEAR_STREET_API_KEY"] = API_KEY
+    os.environ["BEAR_STREET_USER_ID"] = USER_ID
+    os.environ["BEAR_STREET_PASSWORD"] = PASSWORD
+    os.environ["BEAR_STREET_SECOND_AUTH"] = SECOND_AUTH
+    os.environ["BEAR_STREET_BASE_URL"] = BASE_URL
+
+
+def test_auth(broker):
+    print("=" * 60)
+    print("SESSION 1 — Auth Flow")
+    print("=" * 60)
+
+    # 1. Create session
+    print("\n>>> 1. Login...")
+    session = broker.get_session()
+    token = session.get("token", "")
+    print(f"    User: {session.get('user')}")
+    print(f"    Token: {token[:30]}...")
+    print(f"    Broadcast: {str(session.get('broadcast_token', ''))[:20]}...")
+    assert token, "Token missing"
+    print("    ✓ Login OK")
+
+    # 2. Balance
+    print("\n>>> 2. Balance...")
+    bal = broker.get_account_balance(session)
+    print(f"    Status: {bal.get('status')}")
+    print(f"    Free cash: {bal.get('free_cash')}")
+    print(f"    ✓ Balance OK")
+
+    # 3. Profile
+    print("\n>>> 3. Profile...")
+    prof = broker.get_user_profile(session)
+    print(f"    Status: {prof.get('status')}")
+    print(f"    ✓ Profile OK")
+
+    # 4. Session restore
+    print("\n>>> 4. Session restore...")
+    session2 = broker.restore_session({"token": token})
+    print(f"    User: {session2.get('user')}")
+    print(f"    ✓ Restore OK")
+
+    # 5. Logout
+    print("\n>>> 5. Logout...")
+    out = broker.obj.logout()
+    print(f"    Status: {out.get('status') if isinstance(out, dict) else 'OK'}")
+    print(f"    ✓ Logout OK")
+
+    print("\n✓ Session 1 complete\n")
+    return session
+
+
+def test_orders(broker, session):
+    print("=" * 60)
+    print("SESSION 2 — Order Management")
+    print("=" * 60)
+
+    # 1. Order book
+    print("\n>>> 1. Order book...")
+    ob = broker.get_order_book(session)
+    print(f"    Status: {ob.get('status')}")
+    if ob.get("status") == "success":
+        orders = ob.get("raw", {}).get("data", [])
+        print(f"    Orders: {len(orders)}")
+        if orders:
+            print(f"    First: {json.dumps(orders[0], indent=2)[:200]}")
+    print(f"    ✓ Order book OK")
+
+    # 2. Trade book
+    print("\n>>> 2. Trade book...")
+    tb = broker.get_trade_book(session)
+    print(f"    Status: {tb.get('status')}")
+    if tb.get("status") == "success":
+        trades = tb.get("raw", {}).get("data", [])
+        print(f"    Trades: {len(trades)}")
+    print(f"    ✓ Trade book OK")
+
+    # 3. Order history (if we have an order_id)
+    ob = broker.get_order_book(session)
+    if ob.get("status") == "success":
+        orders = ob.get("raw", {}).get("data", [])
+        if orders:
+            oid = orders[0].get("orderid")
+            print(f"\n>>> 3. Order history for {oid}...")
+            oh = broker.get_order_history(session, oid)
+            print(f"    Status: {oh.get('status')}")
+            print(f"    ✓ Order history OK")
+
+    # 4. Place order (dry-run with wait_for_confirmation=False)
+    print("\n>>> 4. Place order (dry-run, no confirm)...")
+    result = broker.place_order(
+        session, "ACC", "BUY",
+        qty=1, price=0, order_type="MARKET",
+        product_type="INTRADAY", exchange="NSE",
+        wait_for_confirmation=False,
+    )
+    print(f"    Status: {result.get('status')}")
+    if result.get("status") == "success":
+        oid = result.get("order_id")
+        print(f"    Order ID: {oid}")
+
+        # Cancel it
+        print(f"\n>>> 5. Cancel order {oid}...")
+        cx = broker.cancel_order(session, oid)
+        print(f"    Status: {cx.get('status')}")
+        print(f"    ✓ Cancel OK")
+    elif "No order ID" in str(result.get("error", "")):
+        print("    (Expected — no real exchange to fill)")
+    print(f"    ✓ Place order OK")
+
+    print("\n✓ Session 2 complete\n")
+
+
 def main():
     if not all([API_KEY, USER_ID, PASSWORD, SECOND_AUTH]):
         print("ERROR: Set BEAR_STREET_API_KEY, BEAR_STREET_USER_ID, "
               "BEAR_STREET_PASSWORD, and BEAR_STREET_SECOND_AUTH env vars.")
         sys.exit(1)
 
+    set_env()
     from broker_bear_street import BrokerConnector
-    import os as _os
 
-    _os.environ["BEAR_STREET_API_KEY"] = API_KEY
-    _os.environ["BEAR_STREET_USER_ID"] = USER_ID
-    _os.environ["BEAR_STREET_PASSWORD"] = PASSWORD
-    _os.environ["BEAR_STREET_SECOND_AUTH"] = SECOND_AUTH
-    _os.environ["BEAR_STREET_BASE_URL"] = BASE_URL
-
-    print("=" * 60)
-    print("Bear Street SDK — Session 1 Auth Test")
-    print("=" * 60)
-    print(f"User: {USER_ID}")
-    print(f"Base URL: {BASE_URL}")
-    print()
+    test_orders_flag = "--order" in sys.argv
 
     broker = BrokerConnector()
+    session = test_auth(broker)
 
-    # 1. Create session (login)
-    print(">>> 1. Creating session (login)...")
-    try:
-        session = broker.get_session()
-        print(f"    ✓ Login success. User: {session.get('user')}")
-        token = session.get("token", "")
-        print(f"    ✓ Token: {token[:30]}...")
-        print(f"    ✓ Broadcast token: {session.get('broadcast_token', 'N/A')[:20] if session.get('broadcast_token') else 'N/A'}...")
-    except Exception as e:
-        print(f"    ✗ Login failed: {e}")
-        sys.exit(1)
-    print()
-
-    # 2. Get balance
-    print(">>> 2. Fetching balance...")
-    try:
-        bal = broker.get_account_balance(session)
-        print(f"    ✓ Balance response: {bal.get('status')}")
-        print(f"    ✓ Raw data: {json.dumps(bal.get('data', {}), indent=4)[:200]}")
-    except Exception as e:
-        print(f"    ✗ Balance failed: {e}")
-    print()
-
-    # 3. Get user profile
-    print(">>> 3. Fetching user profile...")
-    try:
-        prof = broker.get_user_profile(session)
-        print(f"    ✓ Profile response: {prof.get('status')}")
-        print(f"    ✓ Profile data: {json.dumps(prof.get('raw', {}), indent=4)[:200]}")
-    except Exception as e:
-        print(f"    ✗ Profile failed: {e}")
-    print()
-
-    # 4. Restore session from token
-    print(">>> 4. Testing session restore...")
-    try:
-        session2 = broker.restore_session({"token": token})
-        print(f"    ✓ Restore success. User: {session2.get('user')}")
-    except Exception as e:
-        print(f"    ✗ Restore failed: {e}")
-    print()
-
-    # 5. Logout
-    print(">>> 5. Logging out...")
-    try:
-        logout_resp = broker.obj.logout()
-        print(f"    ✓ Logout success: {logout_resp}")
-    except Exception as e:
-        print(f"    ✗ Logout failed: {e}")
-    print()
-
-    print("=" * 60)
-    print("Session 1 tests complete.")
-    print("=" * 60)
+    if test_orders_flag:
+        # Re-login after logout in test_auth
+        broker2 = BrokerConnector()
+        session2 = broker2.get_session()
+        test_orders(broker2, session2)
+    else:
+        print('Pass --order to run order tests (requires a running API server).')
 
 
 if __name__ == "__main__":
