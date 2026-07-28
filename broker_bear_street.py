@@ -705,3 +705,28 @@ class BrokerConnector:
             raise
         except Exception as e:
             return {"status": "error", "error": str(e)}
+
+    def get_symbol_token(self, tradingsymbol, prefer_field="exchange_token"):
+        try:
+            import json, os
+            from pathlib import Path
+            base_dir = Path(__file__).resolve().parent
+            for fname in ("NSE.json", "ticker.json"):
+                fpath = base_dir / fname
+                if fpath.exists():
+                    with open(fpath) as f:
+                        data = json.load(f)
+                    sym_upper = tradingsymbol.upper().replace("-EQ", "")
+                    if isinstance(data, dict):
+                        for k, v in data.items():
+                            k_upper = k.upper().replace("-EQ", "")
+                            if k_upper == sym_upper or k_upper == f"{sym_upper}-EQ":
+                                return str(v) if not isinstance(v, dict) else str(v.get(prefer_field, v.get("token", "")))
+                    elif isinstance(data, list):
+                        for item in data:
+                            sym = (item.get("tradingsymbol") or item.get("symbol") or "").upper().replace("-EQ", "")
+                            if sym == sym_upper:
+                                return str(item.get(prefer_field) or item.get("token") or item.get("exchange_token") or "")
+        except Exception:
+            pass
+        return None
