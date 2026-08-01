@@ -8,7 +8,7 @@ SUPPORTED_BROKERS = {BROKER_ANGEL, BROKER_TRADEX, BROKER_BEAR_STREET}
 
 DEFAULT_TRADEX_BASE_URL = "https://tradex.saral-info.com:30001/TradeXApi/v1"
 DEFAULT_TRADEX_WEBSOCKET_URL = "wss://tradex.saral-info.com:30001"
-DEFAULT_BEAR_STREET_BASE_URL = "http://localhost:3100"
+DEFAULT_BEAR_STREET_BASE_URL = "https://connectorservices.odinconnector.co.in/interactive"
 
 
 def normalize_broker_type(broker_type: Optional[str]) -> str:

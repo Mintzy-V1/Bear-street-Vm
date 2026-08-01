@@ -1350,8 +1350,10 @@ async def authenticate_credentials(credentials: BrokerCredentials , request:Requ
             "api_key": credentials.api_key,
             "client_code": credentials.client_code,
             "password": credentials.password,
+            "second_auth": credentials.second_auth or "",
+            "source": credentials.source or "WEBAPI",
             "user_id_broker": credentials.user_id_broker or credentials.client_code,
-            "base_url": credentials.base_url or DEFAULT_TRADEX_BASE_URL,
+            "base_url": credentials.base_url or (DEFAULT_BEAR_STREET_BASE_URL if broker_type == BROKER_BEAR_STREET else DEFAULT_TRADEX_BASE_URL),
             "websocket_url": credentials.websocket_url,
             "created_at": datetime.now().isoformat(),
             "status": "credentials_received"
