@@ -56,6 +56,8 @@ def set_broker_env(broker_config: Dict[str, Any]) -> str:
         os.environ["BEAR_STREET_USER_ID"] = broker_config.get("user_id_broker") or broker_config.get("client_code", "")
         os.environ["BEAR_STREET_PASSWORD"] = broker_config.get("password", "")
         os.environ["BEAR_STREET_SECOND_AUTH"] = broker_config.get("second_auth") or ""
+        os.environ["BEAR_STREET_SECOND_AUTH_TYPE"] = broker_config.get("second_auth_type") or "OTP"
+        os.environ["BEAR_STREET_LOGIN_TYPE"] = broker_config.get("login_type") or "PASSWORD"
         os.environ["BEAR_STREET_SOURCE"] = broker_config.get("source", "WEBAPI")
         os.environ["BEAR_STREET_BASE_URL"] = broker_config.get("base_url") or DEFAULT_BEAR_STREET_BASE_URL
     return bt
@@ -75,7 +77,8 @@ def clear_broker_env(broker_type: Optional[str] = None) -> None:
     else:
         for key in [
             "BEAR_STREET_API_KEY", "BEAR_STREET_USER_ID", "BEAR_STREET_PASSWORD",
-            "BEAR_STREET_SECOND_AUTH", "BEAR_STREET_SOURCE", "BEAR_STREET_BASE_URL",
+            "BEAR_STREET_SECOND_AUTH", "BEAR_STREET_SECOND_AUTH_TYPE", "BEAR_STREET_LOGIN_TYPE",
+            "BEAR_STREET_SOURCE", "BEAR_STREET_BASE_URL",
         ]:
             os.environ.pop(key, None)
 
@@ -100,6 +103,8 @@ def broker_config_from_session(session_data: Dict[str, Any]) -> Dict[str, Any]:
         "client_code": session_data.get("client_code") or session_data.get("user_id"),
         "password": session_data.get("password"),
         "second_auth": session_data.get("second_auth", ""),
+        "second_auth_type": session_data.get("second_auth_type") or "OTP",
+        "login_type": session_data.get("login_type") or "PASSWORD",
         "source": session_data.get("source", "WEBAPI"),
         "user_id_broker": session_data.get("user_id_broker") or session_data.get("user_id"),
         "base_url": session_data.get("base_url") or DEFAULT_BEAR_STREET_BASE_URL,

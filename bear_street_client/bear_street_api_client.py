@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from urllib.parse import quote
 import requests
 from dataclasses import asdict
 from dotenv import load_dotenv, set_key, get_key
@@ -21,6 +22,7 @@ from bear_street_client.exceptions import (
 class BearStreetClient:
 
     def __init__(self, api_key, user_id, password, second_auth, source="WEBAPI",
+                 second_auth_type="OTP", login_type="PASSWORD",
                  base_url=None, debug=False, timeout=10, env_file=".env"):
         self.env_file = env_file
         load_dotenv(dotenv_path=self.env_file)
@@ -33,6 +35,8 @@ class BearStreetClient:
         self.user_id = user_id
         self.password = password
         self.second_auth = second_auth
+        self.second_auth_type = second_auth_type
+        self.login_type = login_type
         self.source = source
 
         self.token = None
@@ -40,6 +44,7 @@ class BearStreetClient:
 
         self.headers = {
             "Content-Type": "application/json",
+            "x-api-key": self.api_key,
         }
 
         if not self.api_key or not self.user_id or not self.password or not self.second_auth:
@@ -53,8 +58,9 @@ class BearStreetClient:
 
         payload = {
             "user_id": self.user_id,
-            "login_type": "PASSWORD",
+            "login_type": self.login_type,
             "password": self.password,
+            "second_auth_type": self.second_auth_type,
             "second_auth": self.second_auth,
             "api_key": self.api_key,
             "source": self.source,
@@ -146,15 +152,17 @@ class BearStreetClient:
         return response
 
     def modify_order(self, exchange, order_id, modify_details):
+        encoded_order_id = self._encode_order_id(order_id)
         if self.debug:
-            print(f"[MODIFY ORDER] PUT /transactional/v1/orders/regular/{exchange}/{order_id}")
-        response = self._put(f"transactional/v1/orders/regular/{exchange}/{order_id}", payload=modify_details)
+            print(f"[MODIFY ORDER] PUT /transactional/v1/orders/regular/{exchange}/{encoded_order_id}")
+        response = self._put(f"transactional/v1/orders/regular/{exchange}/{encoded_order_id}", payload=modify_details)
         return response
 
     def cancel_order(self, exchange, order_id):
+        encoded_order_id = self._encode_order_id(order_id)
         if self.debug:
-            print(f"[CANCEL ORDER] DELETE /transactional/v1/orders/regular/{exchange}/{order_id}")
-        response = self._delete(f"transactional/v1/orders/regular/{exchange}/{order_id}")
+            print(f"[CANCEL ORDER] DELETE /transactional/v1/orders/regular/{exchange}/{encoded_order_id}")
+        response = self._delete(f"transactional/v1/orders/regular/{exchange}/{encoded_order_id}")
         return response
 
     def place_cover_order(self, order_details):
@@ -164,15 +172,17 @@ class BearStreetClient:
         return response
 
     def modify_cover_order(self, exchange, order_id, modify_details):
+        encoded_order_id = self._encode_order_id(order_id)
         if self.debug:
-            print(f"[MODIFY COVER] PUT /transactional/v1/orders/cover/{exchange}/{order_id}")
-        response = self._put(f"transactional/v1/orders/cover/{exchange}/{order_id}", payload=modify_details)
+            print(f"[MODIFY COVER] PUT /transactional/v1/orders/cover/{exchange}/{encoded_order_id}")
+        response = self._put(f"transactional/v1/orders/cover/{exchange}/{encoded_order_id}", payload=modify_details)
         return response
 
     def cancel_cover_order(self, exchange, order_id):
+        encoded_order_id = self._encode_order_id(order_id)
         if self.debug:
-            print(f"[CANCEL COVER] DELETE /transactional/v1/orders/cover/{exchange}/{order_id}")
-        response = self._delete(f"transactional/v1/orders/cover/{exchange}/{order_id}")
+            print(f"[CANCEL COVER] DELETE /transactional/v1/orders/cover/{exchange}/{encoded_order_id}")
+        response = self._delete(f"transactional/v1/orders/cover/{exchange}/{encoded_order_id}")
         return response
 
     def place_bracket_order(self, order_details):
@@ -182,61 +192,75 @@ class BearStreetClient:
         return response
 
     def modify_bracket_order(self, exchange, order_id, modify_details):
+        encoded_order_id = self._encode_order_id(order_id)
         if self.debug:
-            print(f"[MODIFY BRACKET] PUT /transactional/v1/orders/bracket/{exchange}/{order_id}")
-        response = self._put(f"transactional/v1/orders/bracket/{exchange}/{order_id}", payload=modify_details)
+            print(f"[MODIFY BRACKET] PUT /transactional/v1/orders/bracket/{exchange}/{encoded_order_id}")
+        response = self._put(f"transactional/v1/orders/bracket/{exchange}/{encoded_order_id}", payload=modify_details)
         return response
 
-    def exit_bracket_order(self, order_id):
+    def exit_bracket_order(self, exchange, order_id):
+        encoded_order_id = self._encode_order_id(order_id)
         if self.debug:
-            print(f"[EXIT BRACKET] DELETE /transactional/v1/orders/bracket/{order_id}")
-        response = self._delete(f"transactional/v1/orders/bracket/{order_id}")
+            print(f"[EXIT BRACKET] DELETE /transactional/v1/orders/bracket/{exchange}/{encoded_order_id}")
+        response = self._delete(f"transactional/v1/orders/bracket/{exchange}/{encoded_order_id}")
         return response
 
-    def get_order_book(self, offset=1, limit=100, order_id=None):
+    def get_order_book(self, offset=1, limit=100, order_status=None):
         if self.debug:
-            print(f"[ORDER BOOK] GET /transactional/v1/orders offset={offset} limit={limit}")
+            print(f"[ORDER BOOK] GET /transactional/v1/orders offset={offset} limit={limit} orderStatus={order_status}")
         params = {"offset": offset, "limit": limit}
-        if order_id:
-            params["order_id"] = order_id
+        if order_status is not None:
+            params["orderStatus"] = order_status
         response = self._get("transactional/v1/orders", params=params)
         return response
 
-    def get_trade_book(self, offset=1, limit=100, order_id=None):
+    def get_trade_book(self, offset=1, limit=100, order_id=None, order_ids=None):
         if self.debug:
             print(f"[TRADE BOOK] GET /transactional/v1/trades offset={offset} limit={limit}")
         params = {"offset": offset, "limit": limit}
         if order_id:
             params["order_id"] = order_id
+        if order_ids:
+            params["order_ids"] = ",".join(order_ids) if isinstance(order_ids, (list, tuple)) else order_ids
         response = self._get("transactional/v1/trades", params=params)
         return response
 
     def get_order_history(self, order_id):
+        encoded_order_id = self._encode_order_id(order_id)
         if self.debug:
-            print(f"[ORDER HISTORY] GET /transactional/v1/orders/{order_id}")
-        response = self._get(f"transactional/v1/orders/{order_id}")
+            print(f"[ORDER HISTORY] GET /transactional/v1/orders/{encoded_order_id}")
+        response = self._get(f"transactional/v1/orders/{encoded_order_id}")
         return response
 
     # -------------------------------------------------------------------------
     # PORTFOLIO ENDPOINTS
     # -------------------------------------------------------------------------
 
-    def get_positions(self):
+    def get_positions(self, position_type="all", introp_status=None):
         if self.debug:
-            print("[POSITIONS] GET /portfolio/v1/positions")
-        response = self._get("portfolio/v1/positions")
+            print(f"[POSITIONS] GET /transactional/v1/portfolio/positions/{position_type}")
+        params = {}
+        if introp_status is not None:
+            params["intropStatus"] = introp_status
+        response = self._get(f"transactional/v1/portfolio/positions/{position_type}", params=params or None)
         return response
 
     def get_holdings(self):
         if self.debug:
-            print("[HOLDINGS] GET /portfolio/v1/holdings")
-        response = self._get("portfolio/v1/holdings")
+            print("[HOLDINGS] GET /transactional/v1/portfolio/holdings")
+        response = self._get("transactional/v1/portfolio/holdings")
         return response
 
     def convert_position(self, req: PositionConversionRequest):
         if self.debug:
-            print(f"[CONVERT] PUT /portfolio/v1/positions/convert")
-        response = self._put("portfolio/v1/positions/convert", payload=req.get_dict())
+            print("[CONVERT] PUT /transactional/v1/portfolio/positions")
+        response = self._put("transactional/v1/portfolio/positions", payload=req.get_dict())
+        return response
+
+    def get_position_conversion_inquiry(self, order_id):
+        if self.debug:
+            print(f"[CONVERT INQUIRY] GET /transactional/v1/portfolio/positions orderId={order_id}")
+        response = self._get("transactional/v1/portfolio/positions", params={"orderId": order_id})
         return response
 
     def get_ltp(self, exchange, symbol_token):
@@ -254,6 +278,9 @@ class BearStreetClient:
     def set_access_token(self, token):
         self.token = token
         self.headers["Authorization"] = f"Bearer {token}"
+
+    def _encode_order_id(self, order_id):
+        return quote(str(order_id), safe="")
 
     def _get(self, endpoint, params=None):
         url = f"{self.base_url.rstrip('/')}/{endpoint.lstrip('/')}"

@@ -51,6 +51,8 @@ class BrokerConnector:
         self.user_id = os.getenv("BEAR_STREET_USER_ID", "").strip()
         self.password = os.getenv("BEAR_STREET_PASSWORD", "").strip()
         self.second_auth = os.getenv("BEAR_STREET_SECOND_AUTH", "").strip()
+        self.second_auth_type = os.getenv("BEAR_STREET_SECOND_AUTH_TYPE", "OTP").strip() or "OTP"
+        self.login_type = os.getenv("BEAR_STREET_LOGIN_TYPE", "PASSWORD").strip() or "PASSWORD"
         self.source = os.getenv("BEAR_STREET_SOURCE", "WEBAPI").strip()
         self.base_url = os.getenv("BEAR_STREET_BASE_URL", DEFAULT_BEAR_STREET_BASE_URL).strip()
 
@@ -68,6 +70,8 @@ class BrokerConnector:
             user_id=self.user_id,
             password=self.password,
             second_auth=self.second_auth,
+            second_auth_type=self.second_auth_type,
+            login_type=self.login_type,
             source=self.source,
             base_url=self.base_url,
             env_file=os.path.join(os.path.dirname(__file__), f".bear_street_{self.user_id}.env"),
@@ -405,7 +409,8 @@ class BrokerConnector:
             resp = self._call_api(session["obj"].place_order, req.get_dict())
             order_id = None
             if isinstance(resp, dict):
-                order_id = resp.get("order_id") or (resp.get("data") or {}).get("order_id")
+                data = resp.get("data") or {}
+                order_id = resp.get("order_id") or data.get("orderId") or data.get("order_id")
 
             if not order_id:
                 return {"status": "error", "error": "No order ID in response", "filled": False, "raw": resp}
@@ -592,7 +597,9 @@ class BrokerConnector:
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided."}
         try:
-            resp = self._call_api(session["obj"].exit_bracket_order, order_id)
+            row = self._find_order_row(session, order_id)
+            exchange = (row or {}).get("exchange") or "NSE_EQ"
+            resp = self._call_api(session["obj"].exit_bracket_order, exchange, order_id)
             return {"status": "success", "raw": resp}
         except RuntimeError:
             raise

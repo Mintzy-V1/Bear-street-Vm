@@ -879,6 +879,16 @@ async def fetch_session_from_db(session_id: str) -> Optional[Dict[str, Any]]:
     if password:
         restored["password"] = password
 
+    second_auth = _decrypt_val(doc.get("second_auth")) if doc.get("second_auth") else None
+    if second_auth:
+        restored["second_auth"] = second_auth
+    if doc.get("second_auth_type"):
+        restored["second_auth_type"] = doc.get("second_auth_type")
+    if doc.get("login_type"):
+        restored["login_type"] = doc.get("login_type")
+    if doc.get("source"):
+        restored["source"] = doc.get("source")
+
     user_id_broker = _decrypt_val(doc.get("user_id_broker")) if doc.get("user_id_broker") else None
     if user_id_broker:
         restored["user_id_broker"] = user_id_broker
@@ -956,6 +966,10 @@ def _session_metadata_payload(session_id: str) -> Dict[str, Any]:
         "api_key": _encrypt_val(session_data.get("api_key")),
         "client_code": _encrypt_val(session_data.get("client_code")),
         "password": _encrypt_val(session_data.get("password")),
+        "second_auth": _encrypt_val(session_data.get("second_auth")),
+        "second_auth_type": session_data.get("second_auth_type"),
+        "login_type": session_data.get("login_type"),
+        "source": session_data.get("source"),
         "user_id_broker": _encrypt_val(session_data.get("user_id_broker")),
         "base_url": session_data.get("base_url"),
         "websocket_url": session_data.get("websocket_url"),
@@ -1088,11 +1102,13 @@ class BrokerCredentials(BaseModel):
   api_key: str = Field(..., min_length=1, description="Broker API key")
   client_code: str = Field(..., min_length=1, description="Client code / user_id")
   password: str = Field(..., min_length=1, description="Broker password")
-  second_auth: Optional[str] = Field(default=None, description="Bear Street second auth (TOTP/PIN)")
+  second_auth: Optional[str] = Field(default=None, description="OTP / TOTP / PIN value")
+  second_auth_type: Optional[str] = Field(default="OTP", description="OTP / TOTP / FINGERPRINT / REGISTER")
+  login_type: Optional[str] = Field(default="PASSWORD", description="PASSWORD / MPIN / FINGERPRINT / TP_TOKEN")
   user_id_broker: Optional[str] = Field(default=None, description="Broker user_id (defaults to client_code)")
   base_url: Optional[str] = Field(default=None, description="Broker API base URL")
   websocket_url: Optional[str] = Field(default=None, description="Broker websocket URL")
-  source: str = Field(default="WEBAPI", description="Bear Street source")
+  source: str = Field(default="WEBAPI", description="WEBAPI / MOBILEAPI")
 
 
 class TOTPRequest(BaseModel):
@@ -1280,6 +1296,10 @@ async def get_or_restore_session(session_id: str) -> Optional[Dict[str, Any]]:
                         "api_key": db_session.get("api_key"),
                         "client_code": db_session.get("client_code"),
                         "password": db_session.get("password"),
+                        "second_auth": db_session.get("second_auth"),
+                        "second_auth_type": db_session.get("second_auth_type"),
+                        "login_type": db_session.get("login_type"),
+                        "source": db_session.get("source"),
                         "user_id_broker": db_session.get("user_id_broker"),
                         "base_url": db_session.get("base_url"),
                         "websocket_url": db_session.get("websocket_url"),
@@ -1313,6 +1333,10 @@ async def get_or_restore_session(session_id: str) -> Optional[Dict[str, Any]]:
             "api_key": db_session.get("api_key"),
             "client_code": db_session.get("client_code"),
             "password": db_session.get("password"),
+            "second_auth": db_session.get("second_auth"),
+            "second_auth_type": db_session.get("second_auth_type"),
+            "login_type": db_session.get("login_type"),
+            "source": db_session.get("source"),
             "user_id_broker": db_session.get("user_id_broker"),
             "base_url": db_session.get("base_url"),
             "websocket_url": db_session.get("websocket_url"),
@@ -1351,6 +1375,8 @@ async def authenticate_credentials(credentials: BrokerCredentials , request:Requ
             "client_code": credentials.client_code,
             "password": credentials.password,
             "second_auth": credentials.second_auth or "",
+            "second_auth_type": credentials.second_auth_type or "OTP",
+            "login_type": credentials.login_type or "PASSWORD",
             "source": credentials.source or "WEBAPI",
             "user_id_broker": credentials.user_id_broker or credentials.client_code,
             "base_url": credentials.base_url or (DEFAULT_BEAR_STREET_BASE_URL if broker_type == BROKER_BEAR_STREET else DEFAULT_TRADEX_BASE_URL),

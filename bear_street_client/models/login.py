@@ -4,8 +4,11 @@ from dataclasses import dataclass, asdict
 
 @dataclass(kw_only=True)
 class LoginData:
-    access_token: str
+    access_token: Optional[str] = None
     broadcast_access_token: Optional[str] = None
+    register_token: Optional[str] = None
+    ptnType: Optional[str] = None
+    totp_enabled: Optional[bool] = None
     user_name: Optional[str] = None
     login_time: Optional[str] = None
     exchanges: Optional[List[str]] = None
@@ -28,6 +31,7 @@ class LoginRequest:
     api_key: str
     source: str = "WEBAPI"
     login_type: str = "PASSWORD"
+    second_auth_type: Optional[str] = "OTP"
 
     def get_dict(self):
         return asdict(self)

@@ -56,7 +56,7 @@ class BracketOrderRequest:
     part_code: Optional[str] = None
     algo_id: Optional[str] = None
     strategy_id: Optional[str] = None
-    vender_Code: Optional[str] = None
+    vender_code: Optional[str] = None
 
     def get_dict(self):
         d = {"scrip_info": self.scrip_info.get_dict(), "transaction_type": self.transaction_type}
@@ -66,7 +66,7 @@ class BracketOrderRequest:
             d["stoploss_leg"] = self.stoploss_leg.get_dict()
         if self.profit_leg:
             d["profit_leg"] = self.profit_leg.get_dict()
-        for k in ("order_identifier", "part_code", "algo_id", "strategy_id", "vender_Code"):
+        for k in ("order_identifier", "part_code", "algo_id", "strategy_id", "vender_code"):
             v = getattr(self, k, None)
             if v is not None:
                 d[k] = v
