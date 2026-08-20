@@ -196,7 +196,7 @@ class BrokerConnector:
             resp = self._call_api(session["obj"].get_balance)
             return {
                 "status": "success",
-                "free_cash": float(resp.data.equity.get("available", {}).get("cash", 0)) if resp and resp.data and resp.data.equity else 0,
+                "free_cash": float(resp.data.equity.get("net_available", 0)) if resp and resp.data and resp.data.equity else 0,
                 "data": resp.get_dict() if hasattr(resp, "get_dict") else {},
                 "source": "BEAR_STREET_SDK",
             }
