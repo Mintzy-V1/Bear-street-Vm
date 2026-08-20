@@ -43,6 +43,14 @@ from bear_street_client.models.bracket_order import (
 from bear_street_client.models.position_conversion import PositionConversionRequest
 
 
+def _pick(row, *keys, default=None):
+    for k in keys:
+        v = row.get(k)
+        if v is not None and v != "":
+            return v
+    return default
+
+
 class BrokerConnector:
     broker_type = BROKER_BEAR_STREET
 
@@ -51,7 +59,7 @@ class BrokerConnector:
         self.user_id = os.getenv("BEAR_STREET_USER_ID", "").strip()
         self.password = os.getenv("BEAR_STREET_PASSWORD", "").strip()
         self.second_auth = os.getenv("BEAR_STREET_SECOND_AUTH", "").strip()
-        self.second_auth_type = os.getenv("BEAR_STREET_SECOND_AUTH_TYPE", "OTP").strip() or "OTP"
+        self.second_auth_type = os.getenv("BEAR_STREET_SECOND_AUTH_TYPE", "").strip()
         self.login_type = os.getenv("BEAR_STREET_LOGIN_TYPE", "PASSWORD").strip() or "PASSWORD"
         self.source = os.getenv("BEAR_STREET_SOURCE", "WEBAPI").strip()
         self.base_url = os.getenv("BEAR_STREET_BASE_URL", DEFAULT_BEAR_STREET_BASE_URL).strip()
@@ -188,7 +196,7 @@ class BrokerConnector:
             resp = self._call_api(session["obj"].get_balance)
             return {
                 "status": "success",
-                "free_cash": float(resp.data.equity.get("cash", 0)) if resp and resp.data and resp.data.equity else 0,
+                "free_cash": float(resp.data.equity.get("available", {}).get("cash", 0)) if resp and resp.data and resp.data.equity else 0,
                 "data": resp.get_dict() if hasattr(resp, "get_dict") else {},
                 "source": "BEAR_STREET_SDK",
             }
@@ -213,7 +221,7 @@ class BrokerConnector:
     # -------------------------------------------------------------------------
 
     def _normalize_order_row(self, order_row: dict) -> dict:
-        status = (order_row.get("status") or "").upper()
+        status = (_pick(order_row, "status", "orderStatus", "OrderStatus", default="") or "").upper()
         if status in ("EXECUTED", "COMPLETE", "TRADED"):
             orderstatus = "complete"
         elif status in ("CANCELLED", "CANCELED"):
@@ -222,40 +230,40 @@ class BrokerConnector:
             orderstatus = "rejected"
         else:
             orderstatus = status.lower() or "open"
-        sym = (order_row.get("symbol") or "").upper()
+        sym = (_pick(order_row, "symbol", "tradingsymbol", default="") or "").upper()
         if sym and not sym.endswith("-EQ"):
             sym = f"{sym}-EQ"
         return {
-            "orderid": order_row.get("order_id"),
+            "orderid": _pick(order_row, "order_id", "orderId", "OrderNumber", "UniqueCode"),
             "tradingsymbol": sym,
             "orderstatus": orderstatus,
-            "averageprice": float(order_row.get("average_price") or 0),
-            "filledshares": int(order_row.get("traded_quantity") or 0),
-            "price": float(order_row.get("price") or 0),
-            "producttype": (order_row.get("product_type") or "").upper(),
-            "transactiontype": order_row.get("transaction_type"),
-            "text": order_row.get("rejection_reason") or "",
-            "exchange": order_row.get("exchange"),
-            "scrip_token": order_row.get("scrip_token"),
-            "order_identifier": order_row.get("order_identifier"),
+            "averageprice": float(_pick(order_row, "average_price", "avgPrice", "averagePrice", "orderAveragePrice", default=0) or 0),
+            "filledshares": int(_pick(order_row, "traded_quantity", "tradedQty", "filled_quantity", "TradedQTY", default=0) or 0),
+            "price": float(_pick(order_row, "price", "orderPrice", "OrderPrice", default=0) or 0),
+            "producttype": (_pick(order_row, "product_type", "productType", "product", default="") or "").upper(),
+            "transactiontype": _pick(order_row, "transaction_type", "transactionType"),
+            "text": _pick(order_row, "rejection_reason", "rejectionReason", "reason", "Reason", default="") or "",
+            "exchange": _pick(order_row, "exchange"),
+            "scrip_token": _pick(order_row, "scrip_token", "scripToken", "ScripCode"),
+            "order_identifier": _pick(order_row, "order_identifier", "orderIdentifier"),
         }
 
     def _normalize_trade_row(self, trade_row: dict) -> dict:
-        sym = (trade_row.get("symbol") or "").upper()
+        sym = (_pick(trade_row, "symbol", "tradingsymbol", default="") or "").upper()
         if sym and not sym.endswith("-EQ"):
             sym = f"{sym}-EQ"
         return {
-            "orderid": trade_row.get("order_id"),
+            "orderid": _pick(trade_row, "order_id", "orderId", "OrderNumber"),
             "tradingsymbol": sym,
-            "trade_no": trade_row.get("trade_no"),
-            "exchange_order_no": trade_row.get("exchange_order_no"),
-            "transactiontype": trade_row.get("transaction_type"),
-            "producttype": (trade_row.get("product_type") or "").upper(),
-            "trade_quantity": int(trade_row.get("trade_quantity") or 0),
-            "trade_price": float(trade_row.get("trade_price") or 0),
-            "exchange": trade_row.get("exchange"),
-            "trade_timestamp": trade_row.get("trade_timestamp"),
-            "order_identifier": trade_row.get("order_identifier"),
+            "trade_no": _pick(trade_row, "trade_no", "tradeNo", "TradeNumber"),
+            "exchange_order_no": _pick(trade_row, "exchange_order_no", "exchangeOrderNo"),
+            "transactiontype": _pick(trade_row, "transaction_type", "transactionType"),
+            "producttype": (_pick(trade_row, "product_type", "productType", "product", default="") or "").upper(),
+            "trade_quantity": int(_pick(trade_row, "trade_quantity", "tradeQty", "TradeQty", default=0) or 0),
+            "trade_price": float(_pick(trade_row, "trade_price", "tradePrice", "TradedPrice", default=0) or 0),
+            "exchange": _pick(trade_row, "exchange"),
+            "trade_timestamp": _pick(trade_row, "trade_timestamp", "tradeTime", "TradeTime"),
+            "order_identifier": _pick(trade_row, "order_identifier", "orderIdentifier"),
         }
 
     def get_order_book(self, session):
@@ -364,7 +372,7 @@ class BrokerConnector:
     # -------------------------------------------------------------------------
 
     def place_order(self, session, symbol, side, qty=None, quantity=None, price=None,
-                    order_type="MARKET", product_type="INTRADAY", exchange="NSE",
+                    order_type="MARKET", product_type="INTRADAY", exchange="NSE_EQ",
                     variety="NORMAL", lot_based=False, stop_loss=None,
                     trigger_price=None, wait_for_confirmation=True, **kwargs):
         qty = qty or quantity
@@ -390,7 +398,7 @@ class BrokerConnector:
         price_value = 0.0 if is_market else float(price or 0)
         trigger_value = float(trigger_price or stop_loss or 0)
 
-        scrip = ScripInfo(exchange=bear_exchange, symbol=symbol)
+        scrip = ScripInfo(exchange=bear_exchange, symbol=symbol, scrip_token=kwargs.get("scrip_token"))
 
         req = NewOrderRequest(
             scrip_info=scrip,
@@ -437,7 +445,7 @@ class BrokerConnector:
                 return {"status": "error", "error": f"Order {order_id} not found in order book"}
 
             traded_qty = int(row.get("filledshares") or 0)
-            exchange = row.get("exchange") or "NSE"
+            exchange = row.get("exchange") or "NSE_EQ"
             req = ModifyOrderRequest(
                 order_type=kwargs.get("order_type", row.get("orderstatus", "RL")),
                 quantity=int(new_qty or (traded_qty + 1)),
@@ -458,7 +466,7 @@ class BrokerConnector:
             return {"status": "error", "error": "No active session object provided."}
         try:
             row = self._find_order_row(session, order_id)
-            exchange = (row or {}).get("exchange") or "NSE"
+            exchange = (row or {}).get("exchange") or "NSE_EQ"
             resp = self._call_api(session["obj"].cancel_order, exchange, order_id)
             return {"status": "success", "raw": resp}
         except RuntimeError:
@@ -471,11 +479,11 @@ class BrokerConnector:
     # -------------------------------------------------------------------------
 
     def place_cover_order(self, session, symbol, side, qty, price=0,
-                          order_type="RL-MKT", exchange="NSE", **kwargs):
+                          order_type="RL-MKT", exchange="NSE_EQ", **kwargs):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided.", "filled": False}
         try:
-            scrip = ScripInfo(exchange=exchange, symbol=symbol)
+            scrip = ScripInfo(exchange=exchange, symbol=symbol, scrip_token=kwargs.get("scrip_token"))
             req = CoverOrderRequest(
                 scrip_info=scrip,
                 transaction_type=side.upper(),
@@ -496,7 +504,7 @@ class BrokerConnector:
             return {"status": "error", "error": "No active session object provided."}
         try:
             row = self._find_order_row(session, order_id)
-            exchange = (row or {}).get("exchange") or "NSE"
+            exchange = (row or {}).get("exchange") or "NSE_EQ"
             req = CoverOrderRequestForModify(
                 main_leg=CoverMainLeg(
                     order_type=kwargs.get("order_type", "RL-MKT"),
@@ -517,7 +525,7 @@ class BrokerConnector:
             return {"status": "error", "error": "No active session object provided."}
         try:
             row = self._find_order_row(session, order_id)
-            exchange = (row or {}).get("exchange") or "NSE"
+            exchange = (row or {}).get("exchange") or "NSE_EQ"
             resp = self._call_api(session["obj"].cancel_cover_order, exchange, order_id)
             return {"status": "success", "raw": resp}
         except RuntimeError:
@@ -530,11 +538,11 @@ class BrokerConnector:
     # -------------------------------------------------------------------------
 
     def place_bracket_order(self, session, symbol, side, qty, price=0,
-                            trigger_price=None, exchange="NSE", **kwargs):
+                            trigger_price=None, exchange="NSE_EQ", **kwargs):
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided.", "filled": False}
         try:
-            scrip = ScripInfo(exchange=exchange, symbol=symbol)
+            scrip = ScripInfo(exchange=exchange, symbol=symbol, scrip_token=kwargs.get("scrip_token"))
             req = BracketOrderRequest(
                 scrip_info=scrip,
                 transaction_type=side.upper(),
@@ -564,7 +572,7 @@ class BrokerConnector:
             return {"status": "error", "error": "No active session object provided."}
         try:
             row = self._find_order_row(session, order_id)
-            exchange = (row or {}).get("exchange") or "NSE"
+            exchange = (row or {}).get("exchange") or "NSE_EQ"
             req = BracketOrderRequestForModify(
                 main_leg=BracketMainLeg(
                     order_type=kwargs.get("order_type", "RL"),
@@ -611,23 +619,26 @@ class BrokerConnector:
     # -------------------------------------------------------------------------
 
     def _normalize_position_row(self, row: dict) -> dict:
-        sym = (row.get("symbol") or "").upper()
+        sym = (_pick(row, "symbol", "tradingsymbol", default="") or "").upper()
         if sym and not sym.endswith("-EQ"):
             sym = f"{sym}-EQ"
+        net_qty = int(_pick(row, "netqty", "net_quantity", "netQty", "quantity", default=0) or 0)
         return {
-            "exchange": row.get("exchange"),
+            "exchange": _pick(row, "exchange"),
             "tradingsymbol": sym,
-            "producttype": (row.get("product_type") or "").upper(),
-            "transactiontype": row.get("transaction_type"),
-            "quantity": int(row.get("net_quantity") or 0),
-            "buyqty": int(row.get("buy_quantity") or 0),
-            "buyavgprice": float(row.get("avg_buy_price") or 0),
-            "sellqty": int(row.get("sell_quantity") or 0),
-            "sellavgprice": float(row.get("avg_sell_price") or 0),
-            "ltp": float(row.get("ltp") or 0),
-            "mtm": float(row.get("mtm") or 0),
-            "multiplier": int(row.get("multiplier") or 1),
-            "scrip_token": row.get("scrip_token"),
+            "producttype": (_pick(row, "product_type", "productType", "product", default="") or "").upper(),
+            "transactiontype": _pick(row, "transaction_type", "transactionType"),
+            "netqty": net_qty,
+            "quantity": net_qty,
+            "buyqty": int(_pick(row, "buy_quantity", "buyQty", default=0) or 0),
+            "buyavgprice": float(_pick(row, "avg_buy_price", "avgBuyPrice", default=0) or 0),
+            "sellqty": int(_pick(row, "sell_quantity", "sellQty", default=0) or 0),
+            "sellavgprice": float(_pick(row, "avg_sell_price", "avgSellPrice", default=0) or 0),
+            "averageprice": float(_pick(row, "average_price", "avgPrice", "averagePrice", "avgBuyPrice", default=0) or 0),
+            "ltp": float(_pick(row, "ltp", "LTP", "lastPrice", "last_price", default=0) or 0),
+            "mtm": float(_pick(row, "mtm", "MTM", "pnl", default=0) or 0),
+            "multiplier": int(_pick(row, "multiplier", default=1) or 1),
+            "scrip_token": _pick(row, "scrip_token", "scripToken", "ScripCode"),
         }
 
     def get_positions(self, session):

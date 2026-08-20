@@ -1103,7 +1103,7 @@ class BrokerCredentials(BaseModel):
   client_code: str = Field(..., min_length=1, description="Client code / user_id")
   password: str = Field(..., min_length=1, description="Broker password")
   second_auth: Optional[str] = Field(default=None, description="OTP / TOTP / PIN value")
-  second_auth_type: Optional[str] = Field(default="OTP", description="OTP / TOTP / FINGERPRINT / REGISTER")
+  second_auth_type: Optional[str] = Field(default=None, description="OTP / TOTP / FINGERPRINT / REGISTER")
   login_type: Optional[str] = Field(default="PASSWORD", description="PASSWORD / MPIN / FINGERPRINT / TP_TOKEN")
   user_id_broker: Optional[str] = Field(default=None, description="Broker user_id (defaults to client_code)")
   base_url: Optional[str] = Field(default=None, description="Broker API base URL")
@@ -1375,7 +1375,7 @@ async def authenticate_credentials(credentials: BrokerCredentials , request:Requ
             "client_code": credentials.client_code,
             "password": credentials.password,
             "second_auth": credentials.second_auth or "",
-            "second_auth_type": credentials.second_auth_type or "OTP",
+            "second_auth_type": credentials.second_auth_type or None,
             "login_type": credentials.login_type or "PASSWORD",
             "source": credentials.source or "WEBAPI",
             "user_id_broker": credentials.user_id_broker or credentials.client_code,

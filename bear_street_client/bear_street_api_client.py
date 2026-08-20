@@ -22,8 +22,8 @@ from bear_street_client.exceptions import (
 class BearStreetClient:
 
     def __init__(self, api_key, user_id, password, second_auth, source="WEBAPI",
-                 second_auth_type="OTP", login_type="PASSWORD",
-                 base_url=None, debug=False, timeout=10, env_file=".env"):
+                 second_auth_type=None, login_type="PASSWORD",
+                 base_url=None, debug=False, timeout=10, env_file=".env", device_fields=None):
         self.env_file = env_file
         load_dotenv(dotenv_path=self.env_file)
 
@@ -38,6 +38,7 @@ class BearStreetClient:
         self.second_auth_type = second_auth_type
         self.login_type = login_type
         self.source = source
+        self.device_fields = device_fields or {}
 
         self.token = None
         self.broadcast_token = None
@@ -60,11 +61,13 @@ class BearStreetClient:
             "user_id": self.user_id,
             "login_type": self.login_type,
             "password": self.password,
-            "second_auth_type": self.second_auth_type,
             "second_auth": self.second_auth,
             "api_key": self.api_key,
             "source": self.source,
         }
+        if self.second_auth_type:
+            payload["second_auth_type"] = self.second_auth_type
+        payload.update(self.device_fields)
 
         if self.debug:
             print(f"[LOGIN] POST /authentication/v1/user/session user_id={self.user_id}")
@@ -75,7 +78,8 @@ class BearStreetClient:
             raise BearStreetAuthError("Login failed. No valid response received.")
 
         data = response["data"]
-        self.login_data = LoginData(**data) if data else None
+        known = {k: v for k, v in data.items() if k in LoginData.__dataclass_fields__}
+        self.login_data = LoginData(**known) if data else None
 
         if "access_token" not in data:
             raise BearStreetAuthError("Login response missing access_token")
@@ -114,6 +118,16 @@ class BearStreetClient:
             print("[LOGOUT] Done, token cleared from env")
 
         return response
+
+    def validate_session(self):
+        if self.debug:
+            print("[VALIDATE SESSION] PUT /authentication/v1/user/session")
+        return self._put("authentication/v1/user/session")
+
+    def send_otp(self, **body):
+        if self.debug:
+            print("[SEND OTP] POST /authentication/v1/user/password/reset/send-otp")
+        return self._post("authentication/v1/user/password/reset/send-otp", payload=body or None)
 
     def get_balance(self):
         if self.debug:
@@ -204,6 +218,18 @@ class BearStreetClient:
             print(f"[EXIT BRACKET] DELETE /transactional/v1/orders/bracket/{exchange}/{encoded_order_id}")
         response = self._delete(f"transactional/v1/orders/bracket/{exchange}/{encoded_order_id}")
         return response
+
+    def place_multileg(self, order_details):
+        if self.debug:
+            print("[PLACE MULTILEG] POST /transactional/v1/orders/multileg")
+        return self._post("transactional/v1/orders/multileg", payload=order_details)
+
+    def cancel_multileg(self, order_flag, gateway_order_no, payload=None):
+        enc_flag = self._encode_order_id(order_flag)
+        enc_no = self._encode_order_id(gateway_order_no)
+        if self.debug:
+            print(f"[CANCEL MULTILEG] PUT /transactional/v1/orders/multileg/{enc_flag}/{enc_no}")
+        return self._put(f"transactional/v1/orders/multileg/{enc_flag}/{enc_no}", payload=payload)
 
     def get_order_book(self, offset=1, limit=100, order_status=None):
         if self.debug:

@@ -17,6 +17,9 @@ class LoginData:
     product_types_exchange: Optional[Dict[str, Any]] = None
     mpin_enabled: Optional[bool] = None
     fingerprint_enabled: Optional[bool] = None
+    user_status: Optional[str] = None
+    alias_id: Optional[str] = None
+    memberInfo: Optional[Dict[str, Any]] = None
     others: Optional[Dict[str, Any]] = None
 
     def get_dict(self):
@@ -31,7 +34,7 @@ class LoginRequest:
     api_key: str
     source: str = "WEBAPI"
     login_type: str = "PASSWORD"
-    second_auth_type: Optional[str] = "OTP"
+    second_auth_type: Optional[str] = None
 
     def get_dict(self):
         return asdict(self)
