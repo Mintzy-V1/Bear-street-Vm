@@ -398,7 +398,13 @@ class BrokerConnector:
         price_value = 0.0 if is_market else float(price or 0)
         trigger_value = float(trigger_price or stop_loss or 0)
 
-        scrip = ScripInfo(exchange=bear_exchange, symbol=symbol, scrip_token=kwargs.get("scrip_token"))
+        scrip_token = kwargs.get("scrip_token") or self.get_symbol_token(symbol, bear_exchange)
+        scrip = ScripInfo(
+            exchange=bear_exchange,
+            symbol=symbol,
+            series=kwargs.get("series") or ("EQ" if bear_exchange in ("NSE_EQ", "BSE_EQ") else None),
+            scrip_token=int(scrip_token) if scrip_token else None,
+        )
 
         req = NewOrderRequest(
             scrip_info=scrip,
@@ -483,7 +489,12 @@ class BrokerConnector:
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided.", "filled": False}
         try:
-            scrip = ScripInfo(exchange=exchange, symbol=symbol, scrip_token=kwargs.get("scrip_token"))
+            scrip = ScripInfo(
+                exchange=exchange,
+                symbol=symbol,
+                series=kwargs.get("series") or ("EQ" if exchange in ("NSE_EQ", "BSE_EQ") else None),
+                scrip_token=int(kwargs.get("scrip_token") or self.get_symbol_token(symbol, exchange)) if (kwargs.get("scrip_token") or self.get_symbol_token(symbol, exchange)) else None,
+            )
             req = CoverOrderRequest(
                 scrip_info=scrip,
                 transaction_type=side.upper(),
@@ -542,7 +553,12 @@ class BrokerConnector:
         if not session or "obj" not in session:
             return {"status": "error", "error": "No active session object provided.", "filled": False}
         try:
-            scrip = ScripInfo(exchange=exchange, symbol=symbol, scrip_token=kwargs.get("scrip_token"))
+            scrip = ScripInfo(
+                exchange=exchange,
+                symbol=symbol,
+                series=kwargs.get("series") or ("EQ" if exchange in ("NSE_EQ", "BSE_EQ") else None),
+                scrip_token=int(kwargs.get("scrip_token") or self.get_symbol_token(symbol, exchange)) if (kwargs.get("scrip_token") or self.get_symbol_token(symbol, exchange)) else None,
+            )
             req = BracketOrderRequest(
                 scrip_info=scrip,
                 transaction_type=side.upper(),
@@ -724,27 +740,38 @@ class BrokerConnector:
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
-    def get_symbol_token(self, tradingsymbol, prefer_field="exchange_token"):
+    def get_symbol_token(self, tradingsymbol, exchange="NSE_EQ", prefer_field="code"):
+        """Resolve a scrip token from the ODIN scrip master (cached to disk)."""
         try:
-            import json, os
+            import json, os, urllib.request
             from pathlib import Path
             base_dir = Path(__file__).resolve().parent
-            for fname in ("NSE.json", "ticker.json"):
-                fpath = base_dir / fname
-                if fpath.exists():
-                    with open(fpath) as f:
+            cache_path = base_dir / f"scripmaster_{exchange}.json"
+            data = None
+            if cache_path.exists():
+                try:
+                    with open(cache_path) as f:
                         data = json.load(f)
-                    sym_upper = tradingsymbol.upper().replace("-EQ", "")
-                    if isinstance(data, dict):
-                        for k, v in data.items():
-                            k_upper = k.upper().replace("-EQ", "")
-                            if k_upper == sym_upper or k_upper == f"{sym_upper}-EQ":
-                                return str(v) if not isinstance(v, dict) else str(v.get(prefer_field, v.get("token", "")))
-                    elif isinstance(data, list):
-                        for item in data:
-                            sym = (item.get("tradingsymbol") or item.get("symbol") or "").upper().replace("-EQ", "")
-                            if sym == sym_upper:
-                                return str(item.get(prefer_field) or item.get("token") or item.get("exchange_token") or "")
+                except Exception:
+                    data = None
+            if data is None:
+                url = f"https://odinscripmaster.s3.ap-south-1.amazonaws.com/scripfiles/{exchange}.json"
+                data = json.load(urllib.request.urlopen(url, timeout=30))
+                with open(cache_path, "w") as f:
+                    json.dump(data, f)
+            sym_upper = tradingsymbol.upper().replace("-EQ", "")
+            if isinstance(data, list):
+                for item in data:
+                    if (item.get("sym") or "").upper() == sym_upper:
+                        token = item.get("code") or item.get("scrip_token") or item.get("token")
+                        if token is not None:
+                            return str(token)
+            elif isinstance(data, dict):
+                for k, v in data.items():
+                    if k.upper() == sym_upper:
+                        if isinstance(v, dict):
+                            return str(v.get("code") or v.get("scrip_token") or v.get("token") or "")
+                        return str(v)
         except Exception:
             pass
         return None
