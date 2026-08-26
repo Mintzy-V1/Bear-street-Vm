@@ -84,6 +84,8 @@ class TimingLogger:
 
 # Market timezone: IST (UTC+5:30)
 MARKET_TZ = timezone(timedelta(hours=5, minutes=30))
+AUTO_EXIT_TIME = dt_time(15, 0)          # 3:00 PM IST
+AUTO_EXIT_WARNING_TIME = dt_time(14, 55) # 5 min before flatten
 
 
 def load_json(path):
@@ -1569,6 +1571,8 @@ class AutoTrader:
         step = int(candle[:-1]) if candle.endswith("m") else 5
 
         now = self._now_market_time()
+        if now.time() >= AUTO_EXIT_TIME:
+            return
 
         # Get the current locked candle base calculation
         candle_key_str = self._get_candle_key(now, candle)
@@ -1583,19 +1587,25 @@ class AutoTrader:
             missed = int((now - next_run).total_seconds() // (step * 60)) + 1
             next_run += timedelta(minutes=missed * step)
 
+        # Do not sleep past 15:00 IST
+        exit_at = now.replace(hour=AUTO_EXIT_TIME.hour, minute=AUTO_EXIT_TIME.minute, second=0, microsecond=0)
+        if now < exit_at < next_run:
+            next_run = exit_at
+
         sleep_seconds = max(1, (next_run - now).total_seconds())
         print(
             f"[SCHEDULER] now={now.strftime('%H:%M:%S')} "
             f"next={next_run.strftime('%H:%M:%S')} "
             f"sleep={sleep_seconds:.1f}s"
-    )
-
+        )
 
         deadline = time.time() + sleep_seconds
         while time.time() < deadline:
             if self.stop_event.is_set():
                 print("[SCHEDULER] Stop signal mila neend mein  uth raha hoon!")
                 return   #  neend se uthta hai, loop pe wapas jaata hai
+            if self._now_market_time().time() >= AUTO_EXIT_TIME:
+                return
             time.sleep(1)
 
 
@@ -1619,7 +1629,7 @@ class AutoTrader:
         print("  MARKET CLOSE APPROACHING - EXITING ALL POSITIONS")
         print("=" * 80)
         
-        self.alerts.notify(" 1:30 PM - Initiating exit of all positions")
+        self.alerts.notify("15:00 IST - Initiating exit of all positions")
         
         # Get current broker positions
         with self.broker_pos_lock:
@@ -2632,7 +2642,7 @@ class AutoTrader:
 
         # NSE cash market typical intraday window
         market_open  = dt_time(9, 15)   # 9:15 AM IST
-        market_close = dt_time(15, 20)  # 3:20 PM IST (your existing cutoff)
+        market_close = AUTO_EXIT_TIME   # 3:00 PM IST
 
         #temp change 
         # Block weekends or outside this time window
@@ -2746,24 +2756,15 @@ class AutoTrader:
                 # =====================================================
                 now = self._now_market_time()
 
-                #temp change 
-                warning_time = dt_time(15, 25)  # 3:25 PM IST
-                if now.time() >= warning_time and not self._exit_warning_sent:
-                    msg = " 2:25 PM - Market closing in 5 minutes. All positions will be exited at 1:30 PM."
+                if now.time() >= AUTO_EXIT_WARNING_TIME and not self._exit_warning_sent:
+                    msg = "14:55 IST - flattening all positions at 15:00 IST (3:00 PM)."
                     print(f"\n{msg}")
                     self.alerts.notify(msg)
                     self._exit_warning_sent = True
-                
-                # EXIT ALL POSITIONS AT 3:30 PM IST
-                market_exit_time = dt_time(15, 30)  # 3:30 PM IST
-                
-                if now.time() >= market_exit_time:
+
+                if now.time() >= AUTO_EXIT_TIME:
                     print(f"\n[MARKET CLOSE] Current time: {now.strftime('%H:%M:%S')} - Initiating shutdown")
-                    
-                    # Exit all positions
                     self._exit_all_positions_and_stop()
-                    
-                    # Stop the trader
                     self.stop_event.set()
                     break
                 # -------- HARD CANDLE BOUNDARY GATE --------
@@ -3150,6 +3151,10 @@ class AutoTrader:
                         print(f"[DEBUG TOP] symbol_action_taken : {symbol_action_taken}")
                         # Ensuring One signal per cycle
                         if symbol_action_taken:
+                            continue
+
+                        if self._now_market_time().time() >= AUTO_EXIT_WARNING_TIME:
+                            print(f"[ENTRY FREEZE] {sym}: no new entries after 14:55 IST")
                             continue
                         
                         print(f"[DEBUG] risk_veto={risk_veto} sig={sig}")
@@ -3761,12 +3766,12 @@ class AutoTrader:
                 # ==============================
                 market_now = self._now_market_time()
                 now_time = market_now.time()
-                cutoff_time = dt_time(15, 20)
+                cutoff_time = AUTO_EXIT_TIME
                 print("time after analyse after second broker api call : ", time.time()- t_after_brp_call)
                 self.tlog.record("time after analyse after second broker api call" ,t_after_brp_call , note="time analysis of delay")
 
                 if now_time >= cutoff_time:
-                    self.alerts.notify("Backup market close triggered (3:20 PM) - This shouldn't happen!")
+                    self.alerts.notify("Backup market close triggered (15:00 IST)")
                     print("\n" + "=" * 70)
                     print("BACKUP MARKET CLOSE - AUTO-TRADING STOPPED")
                     print("=" * 70)
@@ -3819,6 +3824,9 @@ class AutoTrader:
                 continue
 
     def shutdown(self):
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
         print("[SHUTDOWN] Pehle open positions exit kar raha hoon...")
         try:
             self._exit_all_positions_and_stop()  #  sirf yahan, ek baar
