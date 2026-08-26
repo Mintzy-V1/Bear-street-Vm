@@ -62,22 +62,33 @@ class BearStreetLTPPoller:
                     time.sleep(self.poll_interval)
                     continue
 
+                try:
+                    positions = self.broker.get_positions(self._session)
+                except Exception:
+                    positions = {}
+                price_map = {}
+                if positions.get("status") == "success":
+                    for row in positions.get("raw", {}).get("data", []):
+                        sym = (row.get("tradingsymbol") or row.get("symbol") or "").upper().replace("-EQ", "")
+                        if sym in symbols:
+                            price_map[sym] = row.get("ltp") or row.get("net_price") or row.get("last_price")
+
                 for sym in symbols:
                     try:
-                        resp = self.broker.get_ltp(self._session, "NSE", sym, 0)
-                        if resp.get("status") == "success":
-                            raw = resp.get("raw", {})
-                            data = raw.get("data", raw) if isinstance(raw, dict) else raw
-                            ltp = None
-                            if isinstance(data, dict):
-                                ltp = data.get("ltp") or data.get("LTP") or data.get("last_price")
-                            if ltp is not None:
-                                price = float(ltp)
-                                now = time.time()
-                                prev = self._last_prices.get(sym)
-                                if prev is None or abs(prev - price) > 1e-9:
-                                    self._last_prices[sym] = price
-                                    self.on_tick(sym, price, now)
+                        ltp = price_map.get(sym)
+                        if ltp is None:
+                            continue
+                        price = float(ltp)
+                        now = time.time()
+                        prev = self._last_prices.get(sym)
+                        if prev is None or abs(prev - price) > 1e-9:
+                            self._last_prices[sym] = price
+                            self.on_tick(sym, price, now)
+                        elif prev is not None:
+                            # Always re-emit (even if price is unchanged) so the
+                            # trader's live_pnl push keeps the Redis key fresh
+                            # (TTL 5s) even when ODIN's position price is static.
+                            self.on_tick(sym, price, now)
                     except Exception:
                         pass
             except Exception as e:

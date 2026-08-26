@@ -237,9 +237,9 @@ class BrokerConnector:
             "orderid": _pick(order_row, "order_id", "orderId", "OrderNumber", "UniqueCode"),
             "tradingsymbol": sym,
             "orderstatus": orderstatus,
-            "averageprice": float(_pick(order_row, "average_price", "avgPrice", "averagePrice", "orderAveragePrice", default=0) or 0),
-            "filledshares": int(_pick(order_row, "traded_quantity", "tradedQty", "filled_quantity", "TradedQTY", default=0) or 0),
-            "price": float(_pick(order_row, "price", "orderPrice", "OrderPrice", default=0) or 0),
+            "averageprice": float(_pick(order_row, "average_price", "avgPrice", "averagePrice", "orderAveragePrice", "order_price", "OrderPrice", default=0) or 0),
+            "filledshares": int(_pick(order_row, "traded_quantity", "tradedQty", "filled_quantity", "TradedQTY", "total_quantity", default=0) or 0),
+            "price": float(_pick(order_row, "price", "orderPrice", "OrderPrice", "order_price", default=0) or 0),
             "producttype": (_pick(order_row, "product_type", "productType", "product", default="") or "").upper(),
             "transactiontype": _pick(order_row, "transaction_type", "transactionType"),
             "text": _pick(order_row, "rejection_reason", "rejectionReason", "reason", "Reason", default="") or "",
@@ -638,7 +638,17 @@ class BrokerConnector:
         sym = (_pick(row, "symbol", "tradingsymbol", default="") or "").upper()
         if sym and not sym.endswith("-EQ"):
             sym = f"{sym}-EQ"
-        net_qty = int(_pick(row, "netqty", "net_quantity", "netQty", "quantity", default=0) or 0)
+
+        def _to_float(v, default=0.0):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return default
+
+        net_qty = int(_to_float(_pick(row, "netqty", "net_quantity", "netQty", "quantity", default=0)))
+        buyavgprice = _to_float(_pick(row, "avg_buy_price", "avgBuyPrice", default=0))
+        sellavgprice = _to_float(_pick(row, "avg_sell_price", "avgSellPrice", default=0))
+        avg = buyavgprice if net_qty > 0 else sellavgprice
         return {
             "exchange": _pick(row, "exchange"),
             "tradingsymbol": sym,
@@ -646,14 +656,14 @@ class BrokerConnector:
             "transactiontype": _pick(row, "transaction_type", "transactionType"),
             "netqty": net_qty,
             "quantity": net_qty,
-            "buyqty": int(_pick(row, "buy_quantity", "buyQty", default=0) or 0),
-            "buyavgprice": float(_pick(row, "avg_buy_price", "avgBuyPrice", default=0) or 0),
-            "sellqty": int(_pick(row, "sell_quantity", "sellQty", default=0) or 0),
-            "sellavgprice": float(_pick(row, "avg_sell_price", "avgSellPrice", default=0) or 0),
-            "averageprice": float(_pick(row, "average_price", "avgPrice", "averagePrice", "avgBuyPrice", default=0) or 0),
-            "ltp": float(_pick(row, "ltp", "LTP", "lastPrice", "last_price", default=0) or 0),
-            "mtm": float(_pick(row, "mtm", "MTM", "pnl", default=0) or 0),
-            "multiplier": int(_pick(row, "multiplier", default=1) or 1),
+            "buyqty": int(_to_float(_pick(row, "buy_quantity", "buyQty", default=0))),
+            "buyavgprice": buyavgprice,
+            "sellqty": int(_to_float(_pick(row, "sell_quantity", "sellQty", default=0))),
+            "sellavgprice": sellavgprice,
+            "averageprice": avg or _to_float(_pick(row, "average_price", "avgPrice", "averagePrice", "avgBuyPrice", default=0)),
+            "ltp": _to_float(_pick(row, "ltp", "LTP", "lastPrice", "last_price", "net_price", "netPrice", default=0)),
+            "mtm": _to_float(_pick(row, "mtm", "MTM", "pnl", default=0)),
+            "multiplier": int(_to_float(_pick(row, "multiplier", default=1), default=1)),
             "scrip_token": _pick(row, "scrip_token", "scripToken", "ScripCode"),
         }
 

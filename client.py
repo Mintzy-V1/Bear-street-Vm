@@ -322,14 +322,22 @@ class MarketClient:
 
     def _init_redis(self):
         try:
-            self.redis_client = redis.RedisCluster(
-                host=os.environ.get("REDIS_HOST", "10.45.41.115"),
-                port=int(os.environ.get("REDIS_PORT", "6379")),
-                ssl=True,
-                ssl_cert_reqs=None,
-                decode_responses=True,
-                socket_connect_timeout=5,
-            )
+            if os.environ.get("REDIS_CLUSTER", "").lower() in ("1", "true", "yes"):
+                self.redis_client = redis.RedisCluster(
+                    host=os.environ.get("REDIS_HOST", "10.45.41.115"),
+                    port=int(os.environ.get("REDIS_PORT", "6379")),
+                    ssl=True,
+                    ssl_cert_reqs=None,
+                    decode_responses=True,
+                    socket_connect_timeout=5,
+                )
+            else:
+                self.redis_client = redis.Redis(
+                    host=os.environ.get("REDIS_HOST", "127.0.0.1"),
+                    port=int(os.environ.get("REDIS_PORT", "6379")),
+                    decode_responses=True,
+                    socket_connect_timeout=5,
+                )
             self.redis_client.ping()
             print("[MARKET CLIENT] Redis connected")
         except Exception as e:
