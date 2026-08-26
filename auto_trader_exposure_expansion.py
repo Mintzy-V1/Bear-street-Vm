@@ -1202,11 +1202,37 @@ class AutoTrader:
                     exit_qty,
                     pnl
                 )
+                # FLIP: purani position close ho gayi, ab nayi side OPEN karni hai
+                if action_type in ("FLIP_TO_LONG", "FLIP_TO_SHORT"):
+                    print(f"[FLIP] {symbol}: old position closed, opening new {'LONG' if 'LONG' in action_type else 'SHORT'} position @ {exit_price:.2f}")
+                    with self.positions_lock:
+                        self.positions[symbol] = {
+                            "side": "BUY" if "LONG" in action_type else "SELL",
+                            "qty": broker_pos.get("qty", 0),
+                            "entry_price": exit_price,
+                        }
                 return
             elif action_type in ("EXIT_LONG", "COVER_SHORT", "STOP_LOSS", "MARKET_CLOSE_EXIT"):
                 # Missing price/position for normal exit
                 print(f"[WARN] {symbol}: exit price nahi mili ya position exist nahi karti sirf pop kar rahe hain")
                 self.positions.pop(symbol, None)
+                return
+            elif action_type in ("FLIP_TO_LONG", "FLIP_TO_SHORT"):
+                # FLIP with no existing in-memory position = fresh entry of the new side
+                print(f"[FLIP] {symbol}: no existing position, treating as fresh {'LONG' if 'LONG' in action_type else 'SHORT'} entry @ {exit_price:.2f}")
+                if exit_price <= 0:
+                    order_id = ctx.get("order_id")
+                    if order_id:
+                        exit_price = self._get_fill_price_from_orderbook(order_id, symbol)
+                if exit_price <= 0:
+                    print(f"[WARN] {symbol}: flip entry price nahi mili, position set nahi hua")
+                    return
+                with self.positions_lock:
+                    self.positions[symbol] = {
+                        "side": "BUY" if "LONG" in action_type else "SELL",
+                        "qty": broker_pos.get("qty", 0),
+                        "entry_price": exit_price,
+                    }
                 return
 
             return
@@ -2158,6 +2184,27 @@ class AutoTrader:
     
     # trading snapshot update karne ka function
     def _update_ui_snapshot(self, session_id, cycle, rows):
+        # Seam: ensure self.positions reflects the broker's open positions each
+        # cycle, so live PnL (on_ltp_tick -> _push_live_pnl_to_redis) works even
+        # if the reconcile path did not register the fill.
+        try:
+            broker_rows = (self.broker.get_positions(self.session).get("raw", {}).get("data") or [])
+            for p in broker_rows:
+                sym = (p.get("tradingsymbol") or "").upper().replace("-EQ", "")
+                net_qty = int(p.get("netqty") or 0)
+                if net_qty == 0:
+                    continue
+                with self.positions_lock:
+                    if sym not in self.positions:
+                        self.positions[sym] = {
+                            "side": "BUY" if net_qty > 0 else "SELL",
+                            "qty": abs(net_qty),
+                            "entry_price": float(p.get("averageprice") or 0.0),
+                        }
+                        print(f"[POSITION SEED] {sym}: {'BUY' if net_qty > 0 else 'SELL'} {abs(net_qty)} @ {float(p.get('averageprice') or 0.0):.2f}")
+        except Exception as e:
+            print(f"[POSITION SEED] error: {e}")
+
         snapshot = {
             "cycle": cycle,
             "timestamp": (self.current_cycle_ts_str or self._now_market_time().strftime("%Y-%m-%d %H:%M:%S")),

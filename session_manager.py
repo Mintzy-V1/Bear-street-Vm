@@ -566,7 +566,7 @@ class SessionManager:
         # Get MongoDB connection details
         mongo_uri = os.environ.get(
             "MONGO_URI",
-            "mongodb+srv://ankitarrow:ankitarrow@cluster0.zcajdur.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+            "mongodb+srv://mintzy01ai_db_user:zTqQRkovgKbLXQdp@cluster0.cztcxpr.mongodb.net/?appName=Cluster0"
         )
         mongo_db_name = os.environ.get("MONGO_DB_NAME", "mintzy_plugin")
         
