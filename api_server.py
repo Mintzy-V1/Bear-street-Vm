@@ -143,12 +143,14 @@ MONGO_CONFIG_DB_NAME = os.environ.get("MONGO_CONFIG_DB_NAME") or "test"
 DB_CONNECTED = False
 sessions_collection = None
 logs_collection = None
+pyramid_pnls_collection = None
 try:
     mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
     mongo_db = mongo_client[MONGO_DB_NAME]
     sessions_collection = mongo_db["plugin_sessions"]
     logs_collection = mongo_db["plugin_logs"]
     trading_logs_collection = mongo_db["trading_logs"]
+    pyramid_pnls_collection = mongo_client[MONGO_CONFIG_DB_NAME]["pyramid_pnls"]
 
     # Force server selection to verify connectivity
     mongo_client.admin.command('ping')
@@ -162,6 +164,7 @@ try:
         )
 except Exception as exc:
     logger.warning("MongoDB persistence unavailable (%s)", exc)
+    pyramid_pnls_collection = None
 
 def _limit_rows(rows: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
     if not isinstance(limit, int) or limit <= 0:
@@ -2592,6 +2595,20 @@ async def get_trading_status(session_id: str):
         "exit_time": exit_time,
         "logs": (logs or [])[-100:]
     }
+
+@app.get("/api/trading/pyramid-pnl/{session_id}")
+async def get_pyramid_pnl(session_id: str, x_plugin_api_key: str = Header(None)):
+    if not DB_CONNECTED or pyramid_pnls_collection is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    doc = await run_in_threadpool(
+        pyramid_pnls_collection.find_one,
+        {"session_id": session_id},
+        {"_id": 0},
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Pyramid PnL snapshot not found")
+    return {"success": True, **doc}
+
 
 #exit statusendpoint 
 @app.get("/api/trading/exit-status/{session_id}")

@@ -43,6 +43,14 @@ PYR_MULTS = [1.40, 1.30, 1.20, 1.00, 1.00, 0.75, 0.75, 0.75, 0.75, 0.75]
 # Nifty intraday leverage: use 4x of account free cash for pyramid allocation headroom
 PYRAMID_LEVERAGE_MULTIPLIER = float(os.environ.get("PYRAMID_LEVERAGE_MULTIPLIER", "1"))
 
+# TEMP TEST: when set, pyramid uses this cash instead of live RMS (avoids distributing full broker cash).
+# Default 20000 for sim→live testing. Set env PYRAMID_FREE_CASH_OVERRIDE=none to use real RMS again.
+_raw_pyramid_cash_override = os.environ.get("PYRAMID_FREE_CASH_OVERRIDE", "20000")
+if str(_raw_pyramid_cash_override).strip().lower() in ("", "none", "null"):
+    PYRAMID_FREE_CASH_OVERRIDE = None
+else:
+    PYRAMID_FREE_CASH_OVERRIDE = float(_raw_pyramid_cash_override)
+
 
 def pyramid_multiplier_for_rank(rank) -> Optional[float]:
     try:
@@ -57,6 +65,31 @@ def pyramid_multiplier_for_rank(rank) -> Optional[float]:
     return PYR_MULTS[idx]
 
 
+# Rank-based min profit as % of allocated capital (percent, not decimal)
+PYR_PROFIT_THRESHOLD_PCT = {
+    1: 0.0576,
+    2: 0.0638,
+    3: 0.0744,
+    4: 0.0893,
+    5: 0.0893,
+    6: 0.1190,
+    7: 0.1374,
+    8: 0.1374,
+    9: 0.1374,
+    10: 0.1374,
+}
+
+
+def pyramid_profit_threshold_for_rank(rank, capital_allocated: float) -> Optional[float]:
+    """Min unrealized PnL (Rs) to count as profitable: capital × rank % of allocated."""
+    try:
+        rank_key = int(rank)
+    except (TypeError, ValueError):
+        return None
+    if rank_key < 1 or capital_allocated <= 0:
+        return None
+    pct = PYR_PROFIT_THRESHOLD_PCT.get(rank_key, PYR_PROFIT_THRESHOLD_PCT[10])
+    return float(capital_allocated) * (pct / 100.0)
 
 
 # ==================== TIMING LOGGER ====================
@@ -2350,24 +2383,38 @@ class AutoTrader:
         return None
 
     def _get_pyramid_free_cash(self) -> Optional[float]:
-        """Pyramid uses broker RMS cash, then session TOTP free_cash — never paper ledger."""
-        broker_cash = self._fetch_broker_free_cash(context="PYRAMID")
-        if broker_cash is not None:
-            return broker_cash
-
-        session_free = getattr(self, "session_free_cash", None)
-        if session_free is not None:
+        """Pyramid free cash: test override first — never live 97L RMS/session during test."""
+        override = PYRAMID_FREE_CASH_OVERRIDE
+        if override is not None:
             try:
-                parsed = float(session_free)
-                if parsed >= 0:
-                    print(f"[PYRAMID] using session_free_cash fallback: {parsed:,.2f}")
-                    return parsed
+                parsed_override = float(override)
+                if parsed_override >= 0:
+                    print(
+                        f"[PYRAMID] using PYRAMID_FREE_CASH_OVERRIDE={parsed_override:,.2f} "
+                        f"(skipping live RMS + session_free_cash for test sizing)"
+                    )
+                    return parsed_override
             except (TypeError, ValueError):
-                pass
+                print(f"[PYRAMID] invalid PYRAMID_FREE_CASH_OVERRIDE={override!r} — ignoring")
+
+        
+        # broker_cash = self._fetch_broker_free_cash(context="PYRAMID")
+        # if broker_cash is not None:
+        #     return broker_cash
+        #
+        # session_free = getattr(self, "session_free_cash", None)
+        # if session_free is not None:
+        #     try:
+        #         parsed = float(session_free)
+        #         if parsed >= 0:
+        #             print(f"[PYRAMID] using session_free_cash fallback: {parsed:,.2f}")
+        #             return parsed
+        #     except (TypeError, ValueError):
+        #         pass
 
         print(
-            "[PYRAMID] ABORT — no broker RMS cash and no session_free_cash; "
-            "refusing paper cash_balance fallback"
+            "[PYRAMID] ABORT — test override unavailable and RMS/session fallbacks disabled "
+            "(refusing real ~97L cash for pyramid sizing)"
         )
         return None
 
@@ -2389,6 +2436,37 @@ class AutoTrader:
             "symbols_for_live": symbols_for_live or [],
             "removed_symbols": removed_symbols or [],
         }
+
+    def _persist_pyramid_pnls(self, symbols: list, applied: bool = False, reason: str = None) -> None:
+        sid = getattr(self, "ui_session_id", None) or getattr(self, "session_id", None)
+        base = self.trading_logs_collection
+        if not sid or base is None:
+            return
+        db_name = self._resolve_config_db_name()
+        coll = (
+            base.database.client[db_name]["pyramid_pnls"]
+            if db_name != base.database.name
+            else base.database["pyramid_pnls"]
+        )
+        try:
+            coll.replace_one(
+                {"session_id": str(sid)},
+                {
+                    "session_id": str(sid),
+                    "configuration_id": getattr(self, "configuration_id", None),
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                    "pyramid_applied": applied,
+                    "reason": reason,
+                    "symbols": symbols,
+                },
+                upsert=True,
+            )
+        except Exception as exc:
+            print(f"[PYRAMID-PNL] persist failed: {exc}")
+
+    def _finish_pyramid_handoff(self, result: dict, pnl_rows: list) -> dict:
+        self._persist_pyramid_pnls(pnl_rows, applied=bool(result.get("applied")), reason=result.get("reason"))
+        return result
 
     def _symbols_for_live_from_entries(self, updated_by_symbol: dict) -> list:
         rows = []
@@ -2484,12 +2562,39 @@ class AutoTrader:
         profitable = []
         removed = []
         removed_keys = set()
+        pnl_rows = []
         for sym_key, entry, cap in config_entries:
             unrealized = self._get_symbol_unrealized_pnl(sym_key)
-            if unrealized > 0:
+            rank = entry.get("rank")
+            if rank is None:
+                rank = rank_map.get(sym_key)
+            threshold = pyramid_profit_threshold_for_rank(rank, cap)
+            row = {
+                "symbol": sym_key,
+                "rank": rank,
+                "capital_allocated": round(cap, 2),
+                "unrealized_pnl": round(unrealized, 2),
+                "profit_threshold": round(threshold, 2) if threshold is not None else None,
+                "is_profitable": False,
+            }
+            if threshold is None:
+                removed.append(f"{sym_key}(rank={rank!r}, missing threshold)")
+                removed_keys.add(sym_key)
+                pnl_rows.append(row)
+                continue
+            pct = PYR_PROFIT_THRESHOLD_PCT.get(int(rank), PYR_PROFIT_THRESHOLD_PCT[10])
+            print(
+                f"[PYRAMID-PROFIT] {sym_key}: rank={rank} capital={cap:.2f} "
+                f"pct={pct}% threshold={threshold:.2f} unrealized={unrealized:.2f}"
+            )
+            row["is_profitable"] = unrealized > threshold
+            pnl_rows.append(row)
+            if unrealized > threshold:
                 profitable.append((sym_key, entry, cap, unrealized))
             else:
-                removed.append(f"{sym_key}(unrealized={unrealized:.2f})")
+                removed.append(
+                    f"{sym_key}(rank={rank}, unrealized={unrealized:.2f}, threshold={threshold:.2f})"
+                )
                 removed_keys.add(sym_key)
 
         if removed:
@@ -2497,8 +2602,17 @@ class AutoTrader:
 
         if not profitable:
             print(
-                "[PYRAMID] No symbols with unrealized_pnl > 0 — "
+                "[PYRAMID] No symbols passed rank-based profit threshold — "
                 "skipping Mongo update (master config preserved)"
+            )
+            return self._finish_pyramid_handoff(
+                self._build_pyramid_handoff_result(
+                    applied=False,
+                    live_allowed=False,
+                    reason="no_profitable_symbols",
+                    removed_symbols=[item.split("(")[0] for item in removed],
+                ),
+                pnl_rows,
             )
 
         # --- pyramid cycle-log profitability (disabled) ---
@@ -2536,12 +2650,6 @@ class AutoTrader:
         #         f"{PYRAMID_PROFIT_THRESHOLD_PCT * 100:.3f}% of allocated capital — "
         #         "skipping Mongo update (master config preserved)"
         #     )
-            return self._build_pyramid_handoff_result(
-                applied=False,
-                live_allowed=False,
-                reason="no_profitable_symbols",
-                removed_symbols=[item.split("(")[0] for item in removed],
-            )
 
         profitable_static = []
         for sym_key, entry, current_capital, unrealized in profitable:
@@ -2562,20 +2670,26 @@ class AutoTrader:
 
         if not profitable_static:
             print("[PYRAMID] No profitable symbols with valid rank — aborting update")
-            return self._build_pyramid_handoff_result(
-                applied=False,
-                live_allowed=False,
-                reason="no_profitable_with_valid_rank",
-                removed_symbols=[item.split("(")[0] for item in removed],
+            return self._finish_pyramid_handoff(
+                self._build_pyramid_handoff_result(
+                    applied=False,
+                    live_allowed=False,
+                    reason="no_profitable_with_valid_rank",
+                    removed_symbols=[item.split("(")[0] for item in removed],
+                ),
+                pnl_rows,
             )
 
         capital_after_static_sum = sum(item[5] for item in profitable_static)
         if capital_after_static_sum <= 0:
             print("[PYRAMID] Sum of capital after static multiplier <= 0 — aborting")
-            return self._build_pyramid_handoff_result(
-                applied=False,
-                live_allowed=False,
-                reason="capital_after_static_non_positive",
+            return self._finish_pyramid_handoff(
+                self._build_pyramid_handoff_result(
+                    applied=False,
+                    live_allowed=False,
+                    reason="capital_after_static_non_positive",
+                ),
+                pnl_rows,
             )
 
         dynamic_multiplier = remaining_cash / capital_after_static_sum
@@ -2585,10 +2699,13 @@ class AutoTrader:
         )
         if dynamic_multiplier <= 0:
             print(f"[PYRAMID] dynamic_multiplier <= 0 ({dynamic_multiplier:.4f}) — aborting update")
-            return self._build_pyramid_handoff_result(
-                applied=False,
-                live_allowed=False,
-                reason="dynamic_multiplier_non_positive",
+            return self._finish_pyramid_handoff(
+                self._build_pyramid_handoff_result(
+                    applied=False,
+                    live_allowed=False,
+                    reason="dynamic_multiplier_non_positive",
+                ),
+                pnl_rows,
             )
 
         updated_by_symbol = {}
@@ -2617,10 +2734,13 @@ class AutoTrader:
 
         if not updated_by_symbol:
             print("[PYRAMID] No profitable symbols with valid rank — aborting update")
-            return self._build_pyramid_handoff_result(
-                applied=False,
-                live_allowed=False,
-                reason="no_symbols_updated",
+            return self._finish_pyramid_handoff(
+                self._build_pyramid_handoff_result(
+                    applied=False,
+                    live_allowed=False,
+                    reason="no_symbols_updated",
+                ),
+                pnl_rows,
             )
 
         saved = self._persist_pyramid_merged_updates(
@@ -2634,23 +2754,29 @@ class AutoTrader:
         symbols_for_live = self._symbols_for_live_from_entries(updated_by_symbol)
         if saved:
             self._pyramid_applied = True
-            result = self._build_pyramid_handoff_result(
-                applied=True,
-                live_allowed=len(symbols_for_live) > 0,
-                reason="ok" if symbols_for_live else "no_symbols_for_live",
-                profitable_count=len(symbols_for_live),
-                symbols_for_live=symbols_for_live,
-                removed_symbols=sorted(removed_keys),
+            result = self._finish_pyramid_handoff(
+                self._build_pyramid_handoff_result(
+                    applied=True,
+                    live_allowed=len(symbols_for_live) > 0,
+                    reason="ok" if symbols_for_live else "no_symbols_for_live",
+                    profitable_count=len(symbols_for_live),
+                    symbols_for_live=symbols_for_live,
+                    removed_symbols=sorted(removed_keys),
+                ),
+                pnl_rows,
             )
             self._pyramid_handoff_result_cache = result
             return result
 
-        return self._build_pyramid_handoff_result(
-            applied=False,
-            live_allowed=len(symbols_for_live) > 0,
-            reason="mongo_save_failed",
-            profitable_count=len(symbols_for_live),
-            symbols_for_live=symbols_for_live,
+        return self._finish_pyramid_handoff(
+            self._build_pyramid_handoff_result(
+                applied=False,
+                live_allowed=len(symbols_for_live) > 0,
+                reason="mongo_save_failed",
+                profitable_count=len(symbols_for_live),
+                symbols_for_live=symbols_for_live,
+            ),
+            pnl_rows,
         )
 
     def _persist_paper_state_snapshot(self, event: str = "") -> None:
@@ -3206,6 +3332,19 @@ class AutoTrader:
             return True
         
         print(f"[INFO] Found {len(broker_positions)} position(s) to exit")
+
+        eod_exit_records = {}
+        for pos in broker_positions:
+            sym = pos["symbol"]
+            position_side = pos["side"]
+            exit_side = "SELL" if position_side == "BUY" else "BUY"
+            eod_exit_records[sym] = {
+                "symbol": sym,
+                "position_side": position_side,
+                "exit_side": exit_side,
+                "qty": pos.get("qty", 0),
+                "price": float(pos.get("ltp") or 0.0),
+            }
         
         # Collect all exit orders
         exit_orders = []
@@ -3253,6 +3392,12 @@ class AutoTrader:
                 sym = result.symbol
                 metadata = result.metadata or {}
                 original_side = metadata.get("original_side", "UNKNOWN")
+
+                if sym in eod_exit_records:
+                    if result.avg_price and float(result.avg_price) > 0:
+                        eod_exit_records[sym]["price"] = float(result.avg_price)
+                    elif metadata.get("curr_price"):
+                        eod_exit_records[sym]["price"] = float(metadata["curr_price"])
                 
                 if result.success:
                     successful_exits += 1
@@ -3304,6 +3449,11 @@ class AutoTrader:
         # Final sync
         print("\n[FINAL SYNC] Syncing with broker...")
         self._sync_cash_with_broker()
+
+        try:
+            self._persist_eod_exit_trading_logs(list(eod_exit_records.values()))
+        except Exception as e:
+            print(f"[EOD-LOG] trading_logs insert failed: {e}")
         
         # Clear internal positions
         self.positions.clear()
@@ -3793,6 +3943,49 @@ class AutoTrader:
         )
         except Exception as e:
             print(f"[DB ERROR] Trading snapshot insert failed: {e}")
+
+    def _persist_eod_exit_trading_logs(self, exit_records: list) -> None:
+        """Save 15:00 / shutdown square-off rows to trading_logs for the frontend."""
+        if not exit_records:
+            return
+        session_id = getattr(self, "ui_session_id", None) or getattr(self, "session_id", None)
+        if not session_id:
+            print("[EOD-LOG] No session_id — skipping trading_logs insert")
+            return
+
+        rows = []
+        for rec in exit_records:
+            sym = rec["symbol"]
+            exit_side = rec["exit_side"]
+            position_side = rec["position_side"]
+            qty = int(rec.get("qty") or 0)
+            price = float(rec.get("price") or 0.0)
+            symbol_realized = round(float(self.realized_pnl_by_symbol.get(sym, 0.0)), 2)
+            rows.append({
+                "symbol": sym,
+                "curr_price": round(price, 2),
+                "return_pct": 0.0,
+                "side": position_side,
+                "signal": "",
+                "action": exit_side,
+                "qty": qty,
+                "unrealized_pnl": 0.0,
+                "symbol_unrealized_pnl": 0.0,
+                "symbol_realized_pnl": symbol_realized,
+                "symbol_pnl": symbol_realized,
+                "pnl": symbol_realized,
+            })
+
+        self.current_cycle_ts_str = self._now_market_time().strftime("%Y-%m-%d %H:%M:%S")
+        self.unrealized_pnl = 0.0
+        cycle = (
+            getattr(self, "_current_cycle_count", None)
+            or getattr(self, "_cycle_count", None)
+            or 0
+        )
+        cycle = int(cycle) + 1
+        print(f"[EOD-LOG] Persisting {len(rows)} square-off row(s) to trading_logs (cycle={cycle})")
+        self._update_ui_snapshot(session_id, cycle, rows)
 
     def _sync_cash_with_broker(self):
         print("[SYNC] Syncing cash balance with broker...")

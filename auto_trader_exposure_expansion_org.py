@@ -86,6 +86,7 @@ class TimingLogger:
 MARKET_TZ = timezone(timedelta(hours=5, minutes=30))
 AUTO_EXIT_TIME = dt_time(15, 0)          # 3:00 PM IST
 AUTO_EXIT_WARNING_TIME = dt_time(14, 55) # 5 min before flatten
+STOP_LOCK_TIME = dt_time(14, 15)         # 14:15 IST — exit losers, continue with greens
 
 
 def load_json(path):
@@ -540,6 +541,7 @@ class AutoTrader:
         self._shutdown_done = False
         self.positions_lock = threading.Lock()   #  ADD THIS LINE
         self._exited_symbols = set()  # Symbols manually exited Ã¢â‚¬â€ excluded from future cycles
+        self._stoplock_done = False
 
         # ==================== RMS: RISK MANAGEMENT SYSTEM ====================
         self.rms_triggered = False          # True once daily loss limit is hit
@@ -1733,6 +1735,19 @@ class AutoTrader:
             return True
         
         print(f"[INFO] Found {len(broker_positions)} position(s) to exit")
+
+        eod_exit_records = {}
+        for pos in broker_positions:
+            sym = pos["symbol"]
+            position_side = pos["side"]
+            exit_side = "SELL" if position_side == "BUY" else "BUY"
+            eod_exit_records[sym] = {
+                "symbol": sym,
+                "position_side": position_side,
+                "exit_side": exit_side,
+                "qty": pos.get("qty", 0),
+                "price": float(pos.get("ltp") or 0.0),
+            }
         
         # Collect all exit orders
         exit_orders = []
@@ -1780,6 +1795,12 @@ class AutoTrader:
                 sym = result.symbol
                 metadata = result.metadata or {}
                 original_side = metadata.get("original_side", "UNKNOWN")
+
+                if sym in eod_exit_records:
+                    if result.avg_price and float(result.avg_price) > 0:
+                        eod_exit_records[sym]["price"] = float(result.avg_price)
+                    elif metadata.get("curr_price"):
+                        eod_exit_records[sym]["price"] = float(metadata["curr_price"])
                 
                 if result.success:
                     successful_exits += 1
@@ -1831,6 +1852,11 @@ class AutoTrader:
         # Final sync
         print("\n[FINAL SYNC] Syncing with broker...")
         self._sync_cash_with_broker()
+
+        try:
+            self._persist_eod_exit_trading_logs(list(eod_exit_records.values()))
+        except Exception as e:
+            print(f"[EOD-LOG] trading_logs insert failed: {e}")
         
         # Clear internal positions
         self.positions.clear()
@@ -1853,7 +1879,7 @@ class AutoTrader:
         
         return True
 
-    def exit_single_position(self, symbol: str) -> dict:
+    def exit_single_position(self, symbol: str, log_signal: str = None) -> dict:
         """
         Exit a single symbol's position.
         - Fetches broker positions for this symbol
@@ -1933,6 +1959,37 @@ class AutoTrader:
                 # Mark symbol as exited Ã¢â‚¬â€ will be excluded from next trading cycle
                 self._exited_symbols.add(symbol)
                 print(f"[SINGLE EXIT] {symbol} added to _exited_symbols Ã¢â‚¬â€ will be skipped in future cycles")
+
+                if log_signal:
+                    session_id = getattr(self, "ui_session_id", None) or getattr(self, "session_id", None)
+                    if session_id:
+                        symbol_unrealized_pnl = round(self._get_symbol_unrealized_pnl(symbol), 2)
+                        symbol_realized_pnl = round(float(self.realized_pnl_by_symbol.get(symbol, 0.0)), 2)
+                        symbol_pnl = round(symbol_realized_pnl + symbol_unrealized_pnl, 2)
+                        self.current_cycle_ts_str = self._now_market_time().strftime("%Y-%m-%d %H:%M:%S")
+                        cycle = (
+                            getattr(self, "_current_cycle_count", None)
+                            or getattr(self, "_cycle_count", None)
+                            or 0
+                        )
+                        self._update_ui_snapshot(
+                            session_id,
+                            int(cycle) + 1,
+                            [{
+                                "symbol": symbol,
+                                "curr_price": round(float(curr_price), 2),
+                                "return_pct": 0.0,
+                                "side": side,
+                                "signal": log_signal,
+                                "action": f"{log_signal} EXIT SENT",
+                                "qty": qty,
+                                "unrealized_pnl": symbol_unrealized_pnl,
+                                "symbol_unrealized_pnl": symbol_unrealized_pnl,
+                                "symbol_realized_pnl": symbol_realized_pnl,
+                                "symbol_pnl": symbol_pnl,
+                                "pnl": symbol_pnl,
+                            }],
+                        )
 
                 msg = f"Exit order sent for {symbol} (closing {side} position, qty={qty})"
                 print(f"[SINGLE EXIT] Ã¢Å“â€¦ {msg}")
@@ -2311,6 +2368,49 @@ class AutoTrader:
         except Exception as e:
             print(f"[DB ERROR] Trading snapshot insert failed: {e}")
 
+    def _persist_eod_exit_trading_logs(self, exit_records: list) -> None:
+        """Save 15:00 / shutdown square-off rows to trading_logs for the frontend."""
+        if not exit_records:
+            return
+        session_id = getattr(self, "ui_session_id", None) or getattr(self, "session_id", None)
+        if not session_id:
+            print("[EOD-LOG] No session_id — skipping trading_logs insert")
+            return
+
+        rows = []
+        for rec in exit_records:
+            sym = rec["symbol"]
+            exit_side = rec["exit_side"]
+            position_side = rec["position_side"]
+            qty = int(rec.get("qty") or 0)
+            price = float(rec.get("price") or 0.0)
+            symbol_realized = round(float(self.realized_pnl_by_symbol.get(sym, 0.0)), 2)
+            rows.append({
+                "symbol": sym,
+                "curr_price": round(price, 2),
+                "return_pct": 0.0,
+                "side": position_side,
+                "signal": "",
+                "action": exit_side,
+                "qty": qty,
+                "unrealized_pnl": 0.0,
+                "symbol_unrealized_pnl": 0.0,
+                "symbol_realized_pnl": symbol_realized,
+                "symbol_pnl": symbol_realized,
+                "pnl": symbol_realized,
+            })
+
+        self.current_cycle_ts_str = self._now_market_time().strftime("%Y-%m-%d %H:%M:%S")
+        self.unrealized_pnl = 0.0
+        cycle = (
+            getattr(self, "_current_cycle_count", None)
+            or getattr(self, "_cycle_count", None)
+            or 0
+        )
+        cycle = int(cycle) + 1
+        print(f"[EOD-LOG] Persisting {len(rows)} square-off row(s) to trading_logs (cycle={cycle})")
+        self._update_ui_snapshot(session_id, cycle, rows)
+
     def _sync_cash_with_broker(self):
         print("[SYNC] Syncing cash balance with broker...")
         free_cash = self._get_free_cash()
@@ -2523,6 +2623,93 @@ class AutoTrader:
             return 0.0
 
         return round(pnl, 2)
+
+    @staticmethod
+    def _normalize_config_symbol(symbol: str) -> str:
+        return (symbol or "").upper().replace("-EQ", "").strip()
+
+    def _get_symbol_position_qty(self, symbol: str) -> int:
+        symbol = self._normalize_config_symbol(symbol)
+        with self.positions_lock:
+            pos = self.positions.get(symbol)
+            if pos:
+                return int(pos.get("qty") or 0)
+        with self.broker_pos_lock:
+            for pos in self._broker_positions_cache or []:
+                if pos.get("symbol") == symbol:
+                    return int(pos.get("qty") or 0)
+        return 0
+
+    def _get_symbol_unrealized_pnl(self, symbol: str) -> float:
+        symbol = self._normalize_config_symbol(symbol)
+        with self.live_pnl_lock:
+            tick = self.live_pnl.get(symbol)
+            if tick is not None:
+                return float(tick.get("pnl") or 0.0)
+
+        cache = getattr(self, "_cycle_ltp_cache", {}) or {}
+        ltp = cache.get(symbol)
+        if ltp is not None and float(ltp) > 0:
+            return float(self._calculate_pnl(symbol, float(ltp)))
+
+        with self.broker_pos_lock:
+            for pos in self._broker_positions_cache or []:
+                if pos.get("symbol") == symbol:
+                    ltp = float(pos.get("ltp") or 0.0)
+                    if ltp > 0:
+                        return float(self._calculate_pnl(symbol, ltp))
+        return 0.0
+
+    def _run_stoplock_exits(self, active_symbols: list) -> None:
+        """At 14:15 IST exit open symbols with unrealized_pnl < 0; continue with the rest."""
+        now = self._now_market_time()
+        print(
+            f"[STOPLOCK] Check at {now.strftime('%Y-%m-%d %H:%M:%S')} IST "
+            f"(trigger>={STOP_LOCK_TIME.strftime('%H:%M')})"
+        )
+
+        symbols_to_check = {
+            self._normalize_config_symbol(s) for s in (active_symbols or []) if s
+        }
+
+        with self.broker_pos_lock:
+            self._broker_positions_cache = self._get_broker_positions()
+            for pos in self._broker_positions_cache or []:
+                sym = self._normalize_config_symbol(pos.get("symbol"))
+                if sym:
+                    symbols_to_check.add(sym)
+
+        exited = []
+        continuing = []
+        for sym_key in sorted(symbols_to_check):
+            if sym_key in self._exited_symbols:
+                continue
+
+            qty = self._get_symbol_position_qty(sym_key)
+            if qty == 0:
+                continuing.append(f"{sym_key}(flat)")
+                continue
+
+            unrealized = self._get_symbol_unrealized_pnl(sym_key)
+            if unrealized < 0:
+                print(f"[STOPLOCK] {sym_key} unrealized={unrealized:.2f} — placing exit")
+                result = self.exit_single_position(sym_key, log_signal="STOP_LOCK")
+                if result.get("success"):
+                    exited.append(sym_key)
+                else:
+                    print(
+                        f"[STOPLOCK] {sym_key} exit failed: "
+                        f"{result.get('message', 'unknown error')}"
+                    )
+            else:
+                continuing.append(f"{sym_key}(unrealized={unrealized:.2f})")
+
+        summary = (
+            f"14:15 stop-lock complete — exited: {exited or 'none'}; "
+            f"continuing: {continuing}"
+        )
+        print(f"[STOPLOCK] {summary}")
+        self.alerts.notify(summary)
 
     def convert_candle_to_seconds(self, c):
         c = str(c).lower().strip()
@@ -2879,6 +3066,10 @@ class AutoTrader:
                 # DOUBLE-EXECUTION GUARD (ONE EXECUTION PER CANDLE)
                 # =====================================================
                 now = self._now_market_time()
+
+                if not self._stoplock_done and now.time() >= STOP_LOCK_TIME:
+                    self._run_stoplock_exits(symbols)
+                    self._stoplock_done = True
 
                 if now.time() >= AUTO_EXIT_WARNING_TIME and not self._exit_warning_sent:
                     msg = "14:55 IST - flattening all positions at 15:00 IST (3:00 PM)."
