@@ -4041,7 +4041,7 @@ class AutoTrader:
             # -------------------------------
             traj_col = group["trajectory_pct"].values if "trajectory_pct" in group.columns else None
             regime_col = group["risk_regime"].values if "risk_regime" in group.columns else None
-
+            
             if traj_col is not None and len(traj_col) > 0 and not np.isnan(traj_col[0]):
                 # Use slot 0's trajectory ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the most current signal
                 trajectory_pct = float(traj_col[0])
@@ -4815,6 +4815,7 @@ class AutoTrader:
 
                 session_id = getattr(self, "ui_session_id", "default")
                 ui_rows = []
+                cycle_orders_sent = set()
 
                 # ========== PARALLEL ORDER EXECUTION - PHASE 1: COLLECT ORDERS ==========
                 order_batcher = OrderBatcher()
@@ -5295,7 +5296,7 @@ class AutoTrader:
                     # ========== PHASE 3: PROCESS RESULTS ==========
                     for result in results:
                         t_result = time.time()
-                        sym = result.symbol
+                        sym = result.symbol.upper().replace("-EQ", "")
                         metadata = result.metadata or {}
                         requested_value = metadata.get("order_value", 0.0)
             
@@ -5305,6 +5306,7 @@ class AutoTrader:
                         curr_price = metadata.get("curr_price", 0.0)
                         
                         if result.success and result.filled:
+                            cycle_orders_sent.add(sym)
                             avg_price = result.avg_price
                             filled_qty = result.filled_qty
                             pnl = 0.0
@@ -5387,6 +5389,7 @@ class AutoTrader:
                                     "placed_at": time.time(),
                                     # "metadata": metadata   # redundant
                                 })
+                            cycle_orders_sent.add(sym)
 
                             # Log with live redis price instead of 0.0
                             t_ltp = time.time()
@@ -5459,12 +5462,17 @@ class AutoTrader:
                     held_qty = broker_pos.get("qty", 0) if has_broker_pos else 0
 
                     # SCENARIO 8 : WAIT NO POSITION
-                    if not has_broker_pos and sym not in pending_syms and self._stock_exposure(sym) == 0:
+                    if (
+                        not has_broker_pos
+                        and sym not in pending_syms
+                        and sym not in cycle_orders_sent
+                        and self._stock_exposure(sym) == 0
+                    ):
                         action_taken = "WAIT (no position)"
                         self._log_trade(sym, sig, change_pct, "wait", curr_price, 0, 0.0)
                     
-                    # SCENARIO 9 : PENDING STATUS
-                    elif sym in pending_syms:
+                    # SCENARIO 9 : PENDING STATUS (order sent this cycle or awaiting reconcile)
+                    elif sym in pending_syms or sym in cycle_orders_sent:
                         action_taken = "PENDING (order sent)"
                         self._log_trade(sym, sig, change_pct, "pending", curr_price, held_qty, live_pnl)
 
