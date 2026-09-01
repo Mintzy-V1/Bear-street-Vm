@@ -455,6 +455,17 @@ class SessionManager:
             return True
 
     @classmethod
+    def _get_redis_pid(cls, session_id: str) -> Optional[int]:
+        try:
+            redis_client = cls._redis()
+            if not redis_client:
+                return None
+            pid_str = redis_client.get(f"{cls.REDIS_KEY_PREFIX}{session_id}")
+            return int(pid_str) if pid_str else None
+        except Exception:
+            return None
+
+    @classmethod
     def _wait_for_pid_exit(cls, pid: int, timeout: float = 90.0) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -464,8 +475,65 @@ class SessionManager:
         return not cls._pid_alive(pid)
 
     @classmethod
+    def _reconcile_session_registry(cls, session_id: str) -> None:
+        """
+        Drop stale local/Redis/PID-file worker entries before start/stop decisions.
+        This keeps simulation-to-live handoff from being blocked by dead local
+        worker objects or stale PID tracking.
+        """
+        worker = cls._workers.get(session_id)
+        redis_pid = cls._get_redis_pid(session_id)
+
+        if worker and not worker.is_alive():
+            print(f"[SessionManager] Reconcile: dead local worker for {session_id}")
+            cls._cleanup_worker(session_id)
+            worker = None
+
+        if worker and worker.is_alive():
+            local_pid = worker.process.pid
+            if redis_pid is None:
+                print(
+                    f"[SessionManager] Reconcile: local worker PID={local_pid} for {session_id} "
+                    "but Redis entry is missing - cleaning local worker"
+                )
+                worker.stop_event.set()
+                worker.process.join(timeout=5)
+                if worker.is_alive():
+                    try:
+                        worker.process.terminate()
+                        worker.process.join(timeout=3)
+                    except Exception:
+                        pass
+                cls._cleanup_worker(session_id)
+            elif redis_pid != local_pid:
+                print(
+                    f"[SessionManager] Reconcile: PID mismatch local={local_pid} redis={redis_pid} "
+                    f"for {session_id} - cleaning local registry"
+                )
+                cls._cleanup_worker(session_id)
+
+        redis_pid = cls._get_redis_pid(session_id)
+        if redis_pid is not None and not cls._pid_alive(redis_pid):
+            print(f"[SessionManager] Reconcile: Redis PID={redis_pid} for {session_id} is dead - clearing")
+            try:
+                redis_client = cls._redis()
+                if redis_client:
+                    redis_client.delete(f"{cls.REDIS_KEY_PREFIX}{session_id}")
+            except Exception as e:
+                print(f"[SessionManager] Redis delete failed during reconcile: {e}")
+            cls._workers.pop(session_id, None)
+
+        file_pid = cls._read_worker_pid_file(session_id)
+        if file_pid is not None and not cls._pid_alive(file_pid):
+            print(f"[SessionManager] Reconcile: PID file PID={file_pid} for {session_id} is dead - clearing")
+            cls._clear_worker_pid_file(session_id)
+            cls._clear_worker_pid(session_id)
+
+    @classmethod
     def ensure_worker_stopped(cls, session_id: str, timeout: float = 90.0) -> bool:
         """Block until no live worker remains for this session (local registry + PID lookup)."""
+        cls._reconcile_session_registry(session_id)
+
         worker = cls._workers.get(session_id)
         if worker and worker.is_alive():
             print(f"[SessionManager] ensure_worker_stopped: signaling local worker {session_id}")
@@ -479,10 +547,30 @@ class SessionManager:
                     pass
             cls._cleanup_worker(session_id)
 
-        pid = cls._resolve_worker_pid(session_id)
-        if pid and cls._pid_alive(pid):
-            print(f"[SessionManager] ensure_worker_stopped: terminating PID={pid} for {session_id}")
-            cls._terminate_pid(pid)
+        redis_pid = cls._get_redis_pid(session_id)
+        if redis_pid and cls._pid_alive(redis_pid):
+            print(f"[SessionManager] ensure_worker_stopped: terminating Redis PID={redis_pid} for {session_id}")
+            cls._terminate_pid(redis_pid)
+            if not cls._wait_for_pid_exit(redis_pid, timeout):
+                print(f"[SessionManager] ensure_worker_stopped: Redis PID={redis_pid} still alive for {session_id}")
+                return False
+
+        fallback_pid = cls._resolve_worker_pid(session_id)
+        if fallback_pid and fallback_pid != redis_pid and cls._pid_alive(fallback_pid):
+            print(f"[SessionManager] ensure_worker_stopped: terminating fallback PID={fallback_pid} for {session_id}")
+            cls._terminate_pid(fallback_pid)
+            if not cls._wait_for_pid_exit(fallback_pid, timeout):
+                print(f"[SessionManager] ensure_worker_stopped: fallback PID={fallback_pid} still alive for {session_id}")
+                return False
+
+        cls._reconcile_session_registry(session_id)
+        final_pid = cls._resolve_worker_pid(session_id)
+        still_running = session_id in cls._workers or (
+            final_pid is not None and cls._pid_alive(final_pid)
+        )
+        if still_running:
+            print(f"[SessionManager] ensure_worker_stopped: worker still alive for {session_id}")
+            return False
 
         redis_client = cls._redis()
         if redis_client:
@@ -494,13 +582,6 @@ class SessionManager:
         cls._clear_worker_pid_file(session_id)
         cls._workers.pop(session_id, None)
 
-        pid = cls._resolve_worker_pid(session_id)
-        still_running = session_id in cls._workers or (
-            pid is not None and cls._pid_alive(pid)
-        )
-        if still_running:
-            print(f"[SessionManager] ensure_worker_stopped: worker still alive for {session_id}")
-            return False
         print(f"[SessionManager] ensure_worker_stopped: {session_id} is clear")
         return True
 
@@ -702,7 +783,18 @@ class SessionManager:
             os.kill(pid, signal.SIGTERM)
             print(f"[SessionManager] SIGTERM sent to PID={pid}")
 
-            import psutil
+            try:
+                import psutil
+            except ImportError:
+                print("[SessionManager] psutil not installed - polling PID until exit")
+                if not cls._wait_for_pid_exit(pid, timeout=90):
+                    print(f"[SessionManager] PID={pid} still alive after 90s, sending SIGKILL")
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    return cls._wait_for_pid_exit(pid, timeout=10)
+                return True
 
             try:
                 proc = psutil.Process(pid)
@@ -711,6 +803,7 @@ class SessionManager:
             except psutil.TimeoutExpired:
                 print(f"[SessionManager] PID={pid} still alive after 60s, sending SIGKILL")
                 os.kill(pid, signal.SIGKILL)
+                return cls._wait_for_pid_exit(pid, timeout=10)
             except psutil.NoSuchProcess:
                 print(f"[SessionManager] Process {pid} already exited")
             return True
@@ -727,12 +820,24 @@ class SessionManager:
         
         # Start monitor if not running
         cls._start_monitor()
-        
+
+        cls._reconcile_session_registry(session_id)
+
         # Check if session already exists
         if session_id in cls._workers:
-            print(f"[SessionManager] Session already running: {session_id}")
+            worker = cls._workers[session_id]
+            if not worker.is_alive():
+                print(f"[SessionManager] Stale worker registry for {session_id} - cleaning up")
+                cls._cleanup_worker(session_id)
+            else:
+                print(f"[SessionManager] Session already running: {session_id}")
+                raise RuntimeError(f"Session {session_id} is already running")
+
+        redis_pid = cls._get_redis_pid(session_id)
+        if redis_pid is not None and cls._pid_alive(redis_pid):
+            print(f"[SessionManager] Session already running (Redis PID={redis_pid}): {session_id}")
             raise RuntimeError(f"Session {session_id} is already running")
-        
+
         # Check worker limit
         active_workers = sum(1 for w in cls._workers.values() if w.is_alive())
         if active_workers >= cls.MAX_WORKERS:
@@ -895,6 +1000,7 @@ class SessionManager:
         print(f"[SessionManager] Stop request aaya: '{session_id}'")
         print(f"[SessionManager] Current workers: {list(cls._workers.keys())}")
 
+        cls._reconcile_session_registry(session_id)
         worker = cls._workers.get(session_id)
 
         if not worker:
@@ -902,13 +1008,18 @@ class SessionManager:
             pid = cls._resolve_worker_pid(session_id)
 
             if not pid:
-                print(f"[SessionManager] No worker PID found — treating as already stopped")
+                print(f"[SessionManager] No worker PID found - nothing stopped")
                 cls._clear_worker_pid(session_id)
                 cls._clear_worker_pid_file(session_id)
-                return True
+                return False
 
             print(f"[SessionManager] PID={pid} mila — terminate kar raha hoon...")
             stopped = cls._terminate_pid(pid)
+            if stopped and cls._pid_alive(pid):
+                stopped = cls._wait_for_pid_exit(pid, timeout=90)
+            if not stopped:
+                print(f"[SessionManager] PID={pid} did not stop cleanly for {session_id}")
+                return False
 
             redis_client = cls._redis()
             if redis_client:
@@ -933,6 +1044,11 @@ class SessionManager:
             worker.process.join(timeout=5)
             if worker.is_alive():
                 worker.process.kill()
+                worker.process.join(timeout=5)
+
+        if worker.is_alive():
+            print(f"[SessionManager] Worker still alive after stop attempt: {session_id}")
+            return False
 
         redis_client = cls._redis()
         if redis_client:
