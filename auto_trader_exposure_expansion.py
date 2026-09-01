@@ -43,9 +43,9 @@ PYR_MULTS = [1.40, 1.30, 1.20, 1.00, 1.00, 0.75, 0.75, 0.75, 0.75, 0.75]
 # Nifty intraday leverage: use 4x of account free cash for pyramid allocation headroom
 PYRAMID_LEVERAGE_MULTIPLIER = float(os.environ.get("PYRAMID_LEVERAGE_MULTIPLIER", "1"))
 
-# TEMP TEST: when set, pyramid uses this cash instead of live RMS (avoids distributing full broker cash).
-# Default 20000 for sim→live testing. Set env PYRAMID_FREE_CASH_OVERRIDE=none to use real RMS again.
-_raw_pyramid_cash_override = os.environ.get("PYRAMID_FREE_CASH_OVERRIDE", "20000")
+# TEMP TEST: when set, trading + pyramid use this cash instead of live RMS (avoids deploying full broker cash).
+# Default 30000 for sim→live testing. Set env PYRAMID_FREE_CASH_OVERRIDE=none to use real RMS again.
+_raw_pyramid_cash_override = os.environ.get("PYRAMID_FREE_CASH_OVERRIDE", "30000")
 if str(_raw_pyramid_cash_override).strip().lower() in ("", "none", "null"):
     PYRAMID_FREE_CASH_OVERRIDE = None
 else:
@@ -1200,6 +1200,17 @@ class AutoTrader:
         t0 = time.time()
 
         result = (self._total_symbol_exposure(symbol) + order_value) <= (self.max_exposure_pct * self.initial_capital)
+        if result and PYRAMID_FREE_CASH_OVERRIDE is not None:
+            keys = set(self.reserved_exposure or {})
+            keys.update((self.positions or {}).keys())
+            portfolio = sum(self._total_symbol_exposure(s) for s in keys)
+            cap = float(PYRAMID_FREE_CASH_OVERRIDE)
+            if portfolio + order_value > cap:
+                print(
+                    f"[TEST-CASH-CAP] block {symbol} order_value={order_value:.2f} "
+                    f"portfolio={portfolio:.2f} cap={cap:.2f}"
+                )
+                result = False
 
         elapsed = time.time() - t0
 
@@ -2549,7 +2560,8 @@ class AutoTrader:
         raw_free_cash = float(free_cash)
         leverage_mult = self._resolve_leverage_multiplier(config_doc=config_doc, default=1.0)
         free_cash = raw_free_cash * leverage_mult
-        remaining_cash = free_cash - total_capital_allocated
+        # Distribute the full leveraged cash to pyramided names (do not subtract morning allocations).
+        remaining_cash = free_cash
         print(
             f"[PYRAMID] raw_free_cash={raw_free_cash:.2f} "
             f"leverage=x{leverage_mult} "
@@ -4466,6 +4478,14 @@ class AutoTrader:
         print(f"Broker free cash / available margin: {free_cash:,.2f}")
         self.alerts.notify(f"Broker free cash / available margin: {free_cash:,.2f}")
 
+        if PYRAMID_FREE_CASH_OVERRIDE is not None:
+            capped = min(float(free_cash), float(PYRAMID_FREE_CASH_OVERRIDE))
+            print(
+                f"[TEST-CASH-CAP] using {capped:,.2f} as free cash "
+                f"(broker={float(free_cash):,.2f}, cap={PYRAMID_FREE_CASH_OVERRIDE:,.2f})"
+            )
+            free_cash = capped
+
         if use_broker_cash_as_capital:
             self.initial_capital = free_cash
             self.current_capital = free_cash
@@ -4494,6 +4514,17 @@ class AutoTrader:
                 }
                 for sym, alloc in initial_allocations.items()
             }
+            if PYRAMID_FREE_CASH_OVERRIDE is not None:
+                total_alloc = sum(float(a.get("capital") or 0) for a in self.symbol_allocations.values())
+                cap = float(PYRAMID_FREE_CASH_OVERRIDE)
+                if total_alloc > cap > 0:
+                    scale = cap / total_alloc
+                    for sym, alloc in self.symbol_allocations.items():
+                        alloc["capital"] = round(float(alloc["capital"]) * scale, 2)
+                    print(
+                        f"[TEST-CASH-CAP] scaled symbol allocations "
+                        f"{total_alloc:,.2f} -> {cap:,.2f} (x{scale:.4f})"
+                    )
 
         # RMS loss limit based on total capital allocated across all symbols
         total_allocated = sum(a["capital"] for a in self.symbol_allocations.values()) if self.symbol_allocations else self.initial_capital
