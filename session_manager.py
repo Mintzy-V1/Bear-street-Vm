@@ -375,7 +375,7 @@ class SessionManager:
     Optimized session manager using multiprocessing for true parallelism.
     Each trader runs in its own process with isolated resources.
     """
-    
+     
     _workers: Dict[str, WorkerProcess] = {}
     _manager = None
     _health_queue = None

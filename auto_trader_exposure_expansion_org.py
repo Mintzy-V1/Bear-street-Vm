@@ -3495,6 +3495,7 @@ class AutoTrader:
                                         "side": "NONE",
                                         "signal": "STOP-LOSS",
                                         "action": action_taken,
+                                        "qty": qty,
                                         "unrealized_pnl": symbol_unrealized_pnl,
                                         "symbol_unrealized_pnl": symbol_unrealized_pnl,
                                         "symbol_realized_pnl": symbol_realized_pnl,
@@ -4006,6 +4007,15 @@ class AutoTrader:
 
                     self.tlog.record("PNL_CALC", t_pnl, note=sym)
                     held_qty = broker_pos.get("qty", 0) if has_broker_pos else 0
+                    row_qty = int(held_qty or 0)
+                    if row_qty <= 0 and sym in pending_syms:
+                        row_qty = int(self._get_symbol_position_qty(sym) or 0)
+                        if row_qty <= 0:
+                            with self.pending_lock:
+                                row_qty = sum(
+                                    int(ctx.get("qty") or 0)
+                                    for ctx in self.pending_orders.get(sym, [])
+                                )
 
                     # SCENARIO 8 : WAIT NO POSITION
                     if not has_broker_pos and sym not in pending_syms and self._stock_exposure(sym) == 0:
@@ -4041,6 +4051,7 @@ class AutoTrader:
                         "side": side,
                         "signal": sig,
                         "action": action_taken,
+                        "qty": row_qty,
                         "unrealized_pnl": symbol_unrealized_pnl,
                         "symbol_unrealized_pnl": symbol_unrealized_pnl,
                         "symbol_realized_pnl": symbol_realized_pnl,
