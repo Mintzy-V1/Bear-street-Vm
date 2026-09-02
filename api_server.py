@@ -144,6 +144,7 @@ DB_CONNECTED = False
 sessions_collection = None
 logs_collection = None
 pyramid_pnls_collection = None
+exited_symbols_collection = None
 try:
     mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
     mongo_db = mongo_client[MONGO_DB_NAME]
@@ -151,6 +152,19 @@ try:
     logs_collection = mongo_db["plugin_logs"]
     trading_logs_collection = mongo_db["trading_logs"]
     pyramid_pnls_collection = mongo_client[MONGO_CONFIG_DB_NAME]["pyramid_pnls"]
+    exited_symbols_collection = mongo_client[MONGO_CONFIG_DB_NAME]["exited_symbols"]
+    try:
+        exited_symbols_collection.create_index(
+            [("session_id", 1), ("symbol", 1)],
+            unique=True,
+            name="uniq_session_symbol_exit",
+        )
+        exited_symbols_collection.create_index(
+            [("session_id", 1), ("status", 1)],
+            name="idx_session_exit_status",
+        )
+    except Exception as index_exc:
+        logger.warning("exited_symbols index ensure failed (%s)", index_exc)
 
     # Force server selection to verify connectivity
     mongo_client.admin.command('ping')
@@ -165,6 +179,7 @@ try:
 except Exception as exc:
     logger.warning("MongoDB persistence unavailable (%s)", exc)
     pyramid_pnls_collection = None
+    exited_symbols_collection = None
 
 def _limit_rows(rows: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
     if not isinstance(limit, int) or limit <= 0:
@@ -819,18 +834,50 @@ except Exception as _e:
     print(f"[API SERVER] RMS redis client unavailable: {_e}")
     _rms_redis = None
 
+_live_pnl_endpoint_last_log = {}
+
+
+def _log_live_pnl_endpoint(session_id: str, state: str, message: str, interval: float = 10.0) -> None:
+    try:
+        now = time.time()
+        key = f"{session_id}:{state}"
+        last = float(_live_pnl_endpoint_last_log.get(key, 0.0) or 0.0)
+        if interval <= 0 or now - last >= interval:
+            _live_pnl_endpoint_last_log[key] = now
+            print(message, flush=True)
+    except Exception:
+        pass
+
 
 @app.get("/api/trading/live-pnl/{session_id}")
 def get_live_pnl(session_id: str, x_plugin_api_key: str = Header(None)):
     if not _rms_redis:
+        _log_live_pnl_endpoint(
+            session_id,
+            "redis-unavailable",
+            f"[LIVE-PNL-ENDPOINT] session={session_id} ready=false error=redis_unavailable",
+            interval=5.0,
+        )
         return {"success": False, "error": "Redis unavailable"}
 
     try:
         raw = _rms_redis.get(f"live_pnl:{session_id}")
     except Exception as e:
+        _log_live_pnl_endpoint(
+            session_id,
+            "redis-error",
+            f"[LIVE-PNL-ENDPOINT] session={session_id} ready=false error=redis_error detail={e}",
+            interval=5.0,
+        )
         return {"success": False, "error": f"Redis error: {e}"}
 
     if not raw:
+        _log_live_pnl_endpoint(
+            session_id,
+            "not-ready",
+            f"[LIVE-PNL-ENDPOINT] session={session_id} ready=false raw_missing key=live_pnl:{session_id}",
+            interval=5.0,
+        )
         return {
             "success": True,
             "ready": False,
@@ -839,9 +886,27 @@ def get_live_pnl(session_id: str, x_plugin_api_key: str = Header(None)):
 
     try:
         data = json.loads(raw)
-    except Exception:
+    except Exception as e:
+        _log_live_pnl_endpoint(
+            session_id,
+            "malformed",
+            f"[LIVE-PNL-ENDPOINT] session={session_id} ready=false error=malformed_payload detail={e}",
+            interval=5.0,
+        )
         return {"success": False, "error": "Malformed payload in Redis"}
 
+    symbols = data.get("symbols") or {}
+    _log_live_pnl_endpoint(
+        session_id,
+        "ready",
+        (
+            f"[LIVE-PNL-ENDPOINT] session={session_id} ready=true "
+            f"symbols={list(symbols.keys())} realized={data.get('realized_pnl')} "
+            f"live_unrealized={data.get('live_unrealized_pnl')} total={data.get('total_pnl')} "
+            f"raw_len={len(raw)}"
+        ),
+        interval=5.0,
+    )
     return {"success": True, "ready": True, "data": data}
 
 
@@ -2610,7 +2675,37 @@ async def get_pyramid_pnl(session_id: str, x_plugin_api_key: str = Header(None))
     return {"success": True, **doc}
 
 
-#exit statusendpoint 
+@app.get("/api/trading/exited-symbols/{session_id}")
+async def get_exited_symbols(session_id: str, x_plugin_api_key: str = Header(None)):
+    if not DB_CONNECTED or exited_symbols_collection is None:
+        logger.warning("[EXITED-SYMBOLS-API] database unavailable session_id=%s", session_id)
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    logger.info("[EXITED-SYMBOLS-API] fetch start session_id=%s", session_id)
+    cursor = exited_symbols_collection.find(
+        {"session_id": session_id},
+        {"_id": 0},
+    ).sort([
+        ("exit_time_utc", 1),
+        ("updated_at", 1),
+        ("symbol", 1),
+    ])
+    symbols = await run_in_threadpool(list, cursor)
+    logger.info(
+        "[EXITED-SYMBOLS-API] fetch done session_id=%s count=%s symbols=%s",
+        session_id,
+        len(symbols),
+        [row.get("symbol") for row in symbols],
+    )
+    return {
+        "success": True,
+        "session_id": session_id,
+        "count": len(symbols),
+        "symbols": symbols,
+    }
+
+
+#exit statusendpoint
 @app.get("/api/trading/exit-status/{session_id}")
 async def get_exit_status(session_id: str, x_plugin_api_key: str = Header(None)):
    

@@ -19,6 +19,17 @@ class BearStreetLTPPoller:
         self._thread: Optional[threading.Thread] = None
         self._last_prices: dict = {}
         self._session = None
+        self._debug_last: dict = {}
+
+    def _debug(self, key: str, message: str, interval: float = 10.0) -> None:
+        try:
+            now = time.time()
+            last = float(self._debug_last.get(key, 0.0) or 0.0)
+            if interval <= 0 or now - last >= interval:
+                self._debug_last[key] = now
+                print(message, flush=True)
+        except Exception:
+            pass
 
     def start(self, symbols: Iterable[str]) -> None:
         sym_list = [s.upper() for s in symbols]
@@ -64,33 +75,80 @@ class BearStreetLTPPoller:
 
                 try:
                     positions = self.broker.get_positions(self._session)
-                except Exception:
+                except Exception as e:
+                    self._debug(
+                        "positions:error",
+                        f"[LTP-BS] get_positions error: {e}",
+                        interval=10.0,
+                    )
                     positions = {}
                 price_map = {}
                 if positions.get("status") == "success":
-                    for row in positions.get("raw", {}).get("data", []):
+                    rows = positions.get("raw", {}).get("data", [])
+                    self._debug(
+                        "positions:success",
+                        (
+                            f"[LTP-BS] positions success rows={len(rows)} "
+                            f"watching={symbols}"
+                        ),
+                        interval=10.0,
+                    )
+                    for row in rows:
                         sym = (row.get("tradingsymbol") or row.get("symbol") or "").upper().replace("-EQ", "")
                         if sym in symbols:
                             price_map[sym] = row.get("ltp") or row.get("net_price") or row.get("last_price")
+                    self._debug(
+                        "positions:price-map",
+                        f"[LTP-BS] price_map symbols={list(price_map.keys())}",
+                        interval=10.0,
+                    )
+                else:
+                    self._debug(
+                        "positions:not-success",
+                        f"[LTP-BS] positions not-success response={positions}",
+                        interval=10.0,
+                    )
 
                 for sym in symbols:
                     try:
                         ltp = price_map.get(sym)
                         if ltp is None:
+                            self._debug(
+                                f"missing-ltp:{sym}",
+                                (
+                                    f"[LTP-BS] missing_ltp symbol={sym} "
+                                    f"available_price_symbols={list(price_map.keys())}"
+                                ),
+                                interval=10.0,
+                            )
                             continue
                         price = float(ltp)
                         now = time.time()
                         prev = self._last_prices.get(sym)
                         if prev is None or abs(prev - price) > 1e-9:
                             self._last_prices[sym] = price
+                            self._debug(
+                                f"emit:{sym}",
+                                f"[LTP-BS] emit_tick symbol={sym} ltp={price:.2f} changed=True",
+                                interval=5.0,
+                            )
                             self.on_tick(sym, price, now)
                         elif prev is not None:
                             # Always re-emit (even if price is unchanged) so the
                             # trader's live_pnl push keeps the Redis key fresh
                             # (TTL 5s) even when ODIN's position price is static.
+                            self._debug(
+                                f"emit:{sym}",
+                                f"[LTP-BS] emit_tick symbol={sym} ltp={price:.2f} changed=False",
+                                interval=5.0,
+                            )
                             self.on_tick(sym, price, now)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self._debug(
+                            f"symbol-error:{sym}",
+                            f"[LTP-BS] symbol loop error symbol={sym}: {e}",
+                            interval=10.0,
+                        )
             except Exception as e:
                 print(f"[LTP-BS] poll error: {e}")
                 self._session = None
