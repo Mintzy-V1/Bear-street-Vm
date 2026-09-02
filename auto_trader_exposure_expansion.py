@@ -1528,6 +1528,17 @@ class AutoTrader:
         pos = self._paper_positions.get(symbol)
 
         if action in flip_actions:
+            # Book realized PnL on the close leg before opening the flipped side.
+            if pos and int(pos.get("qty") or 0) > 0:
+                try:
+                    close_qty = int(pos["qty"])
+                    pnl = self._close_position(self.session, symbol, ltp, close_qty)
+                    print(
+                        f"[FLIP-PAPER] {symbol}: closed {pos.get('side')} x{close_qty} "
+                        f"@ {ltp:.2f} | realized={pnl:.2f}"
+                    )
+                except Exception as e:
+                    print(f"[FLIP-PAPER] {symbol}: close-leg PnL failed: {e}")
             new_qty = max(qty // 2, 0)
             if new_qty <= 0:
                 self._paper_positions.pop(symbol, None)
@@ -5392,7 +5403,34 @@ class AutoTrader:
                                     filled_qty,
                                     0.0
                                 )
-                                                          
+
+                            elif action_type in ("FLIP_TO_LONG", "FLIP_TO_SHORT"):
+                                flip_qty = max(int(filled_qty) // 2, 0)
+                                action_taken = (
+                                    f"FLIPPED to {'LONG' if 'LONG' in action_type else 'SHORT'} "
+                                    f"({flip_qty}) @ {avg_price:.2f}"
+                                )
+                                self._log_trade(
+                                    sym,
+                                    action_type,
+                                    change_pct,
+                                    "filled",
+                                    avg_price,
+                                    flip_qty,
+                                    0.0,
+                                )
+
+                            order_value = metadata.get("order_value", 0.0)
+                            if order_value:
+                                try:
+                                    self._release_exposure(sym, order_value)
+                                except Exception as _re:
+                                    print(f"[FILL] {sym}: release_exposure failed: {_re}")
+
+                            # Paper fills are instant — treat as settled for this cycle's UI row.
+                            if getattr(self, "simulation_logs", False):
+                                cycle_orders_sent.discard(sym)
+
                         else:
                             # Order failed at Angel before getting an order_id
                             # (validation rejects like AB1019 / AB4036, RMS rejects, etc).
@@ -5472,6 +5510,10 @@ class AutoTrader:
                 with self.pending_lock:
                     pending_syms = set(self.pending_orders.keys())
 
+                # Paper fills are synchronous — refresh positions before hold/UI snapshot.
+                with self.broker_pos_lock:
+                    self._broker_positions_cache = self._get_broker_positions()
+                    broker_positions = list(self._broker_positions_cache)
 
                 # ========== CONTINUE WITH HOLD POSITIONS ==========
                 for sym, info in signals.items(): 
@@ -5530,14 +5572,14 @@ class AutoTrader:
                     # SCENARIO 9 : PENDING STATUS (order sent this cycle or awaiting reconcile)
                     elif sym in pending_syms or sym in cycle_orders_sent:
                         action_taken = "PENDING (order sent)"
-                        self._log_trade(sym, sig, change_pct, "pending", curr_price, held_qty, live_pnl)
+                        self._log_trade(sym, sig, change_pct, "pending", curr_price, row_qty, live_pnl)
 
                     #  SCENARIO 10 : HOLD WITH OPEN POSITION  log with live PnL
                     elif has_broker_pos:
                         # self._log_trade(sym, sig, change_pct, "hold", curr_price, held_qty, live_pnl)
                         t_log = time.time()
 
-                        self._log_trade(sym, sig, change_pct, "hold", curr_price, held_qty, live_pnl)
+                        self._log_trade(sym, sig, change_pct, "hold", curr_price, row_qty, live_pnl)
 
                         log_time = time.time() - t_log
 

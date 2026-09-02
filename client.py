@@ -348,12 +348,27 @@ class MarketClient:
         self.access_token = get_access_token()
 
     def _load_ticker_map(self):
-        try:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            with open(os.path.join(base_dir, "ticker.json")) as f:
-                self.ticker_map = json.load(f)
-        except Exception:
-            self.ticker_map = {}
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates = []
+        env_path = os.environ.get("TICKER_JSON_PATH", "").strip()
+        if env_path:
+            candidates.append(env_path)
+        candidates.extend([
+            os.path.join(base_dir, "ticker.json"),
+            os.path.join(base_dir, "utils", "ticker.json"),
+        ])
+        for path in candidates:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    self.ticker_map = json.load(f)
+                print(f"[MARKET CLIENT] Loaded {len(self.ticker_map)} Upstox instrument keys from {path}")
+                return
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                print(f"[MARKET CLIENT] Failed to load ticker map from {path}: {e}")
+        print("[MARKET CLIENT] WARNING: ticker.json not found — Upstox LTP will fall back to predictions")
+        self.ticker_map = {}
 
     # ---------------- LIVE PRICE ----------------
 
