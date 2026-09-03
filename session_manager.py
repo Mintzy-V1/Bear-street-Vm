@@ -236,7 +236,11 @@ def _trader_worker(
                 f"broker={getattr(broker, 'broker_type', 'unknown')} "
                 f"symbols={list(allocations.keys())}"
             )
-            ltp_stream = create_ltp_stream(broker, trader.on_ltp_tick)
+            ltp_stream = create_ltp_stream(
+                broker,
+                trader.on_ltp_tick,
+                market_client=getattr(trader, "market_client", None),
+            )
             ltp_stream.start(list(allocations.keys()))
             print(f"[Worker-{session_id}] LiveLTPStream started for {len(allocations)} symbols")
         except Exception as e:
