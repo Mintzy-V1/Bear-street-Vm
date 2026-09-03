@@ -815,7 +815,7 @@ try:
     import redis as _redis
     if _os.environ.get("REDIS_CLUSTER", "").lower() in ("1", "true", "yes"):
         _rms_redis = _redis.RedisCluster(
-            host=_os.environ.get("REDIS_HOST", "10.45.41.115"),
+            host=_os.environ.get("REDIS_HOST", "clustercfg.mintzy-redis.ci2qc0.use1.cache.amazonaws.com"),
             port=int(_os.environ.get("REDIS_PORT", "6379")),
             ssl=True,
             ssl_cert_reqs=None,

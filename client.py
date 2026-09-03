@@ -324,7 +324,7 @@ class MarketClient:
         try:
             if os.environ.get("REDIS_CLUSTER", "").lower() in ("1", "true", "yes"):
                 self.redis_client = redis.RedisCluster(
-                    host=os.environ.get("REDIS_HOST", "10.45.41.115"),
+                    host=os.environ.get("REDIS_HOST", "clustercfg.mintzy-redis.ci2qc0.use1.cache.amazonaws.com"),
                     port=int(os.environ.get("REDIS_PORT", "6379")),
                     ssl=True,
                     ssl_cert_reqs=None,
