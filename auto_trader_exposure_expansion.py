@@ -6125,8 +6125,8 @@ class AutoTrader:
                                     print(f"[FILL] {sym}: release_exposure failed: {_re}")
 
                             # Paper fills are instant — treat as settled for this cycle's UI row.
-                            if getattr(self, "simulation_logs", False):
-                                cycle_orders_sent.discard(sym)
+                            # if getattr(self, "simulation_logs", False):
+                            #     cycle_orders_sent.discard(sym)
 
                         else:
                             # Order failed at Angel before getting an order_id
