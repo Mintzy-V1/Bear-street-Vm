@@ -1,15 +1,23 @@
 import json
 import threading
 import time
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Set
+
+from bear_street_broadcast_feed import (
+    DEFAULT_BROADCAST_SOCKET,
+    BearStreetBroadcastFeed,
+)
+
+# Must match auto_trader_exposure_expansion._now_market_time() / _shared_ltp_bar().
+MARKET_TZ = timezone(timedelta(hours=5, minutes=30))
 
 
 class BearStreetLTPPoller:
     """
     Bear Street LTP poller.
 
-    Primary: ODIN market quote APIs (get_ltp / get_bulk_ltp) for watched symbols.
+    Primary: ODIN broadcast WebSocket (broadCastSocket + broadcast_access_token).
     Fallback: shared Redis candle LTP, Upstox 1m intraday close, then live positions.
     """
 
@@ -33,7 +41,7 @@ class BearStreetLTPPoller:
         self._debug_last: dict = {}
         self._token_cache: Dict[str, int] = {}
         self._upstox_last_fetch: Dict[str, float] = {}
-        self._quote_exchanges = ("NSE", "NSE_EQ")
+        self._broadcast_feed: Optional[BearStreetBroadcastFeed] = None
 
     def _debug(self, key: str, message: str, interval: float = 10.0) -> None:
         try:
@@ -51,6 +59,8 @@ class BearStreetLTPPoller:
         with self._lock:
             self._symbols.update(sym_list)
         if self._thread and self._thread.is_alive():
+            if self._session is not None:
+                self._ensure_broadcast_feed(self._session, list(self._symbols))
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._poll_loop, name="BearStreetLTPPoller", daemon=True)
@@ -59,16 +69,28 @@ class BearStreetLTPPoller:
     def subscribe(self, symbol: str) -> None:
         with self._lock:
             self._symbols.add(symbol.upper().replace("-EQ", ""))
+            symbols = list(self._symbols)
+        if self._session is not None:
+            self._ensure_broadcast_feed(self._session, symbols)
 
     def unsubscribe(self, symbol: str) -> None:
         with self._lock:
             self._symbols.discard(symbol.upper().replace("-EQ", ""))
+            symbols = list(self._symbols)
+        if self._session is not None:
+            self._ensure_broadcast_feed(self._session, symbols)
 
     def stop(self) -> None:
         self._stop.set()
+        if self._broadcast_feed is not None:
+            self._broadcast_feed.stop()
+            self._broadcast_feed = None
 
     def _normalize_symbol(self, symbol: str) -> str:
         return (symbol or "").upper().replace("-EQ", "")
+
+    def _now_market_time(self) -> datetime:
+        return datetime.now(MARKET_TZ)
 
     def _get_symbol_token(self, symbol: str) -> Optional[int]:
         sym = self._normalize_symbol(symbol)
@@ -103,6 +125,65 @@ class BearStreetLTPPoller:
                     interval=30.0,
                 )
         return token_map
+
+    def _get_broadcast_socket(self, session) -> str:
+        sock = (session or {}).get("broadcast_socket") or ""
+        if sock:
+            return sock.strip()
+        obj = (session or {}).get("obj")
+        login_data = getattr(obj, "login_data", None) if obj else None
+        others = getattr(login_data, "others", None) if login_data else None
+        if isinstance(others, dict):
+            return (others.get("broadCastSocket") or others.get("broadcastSocket") or "").strip()
+        return ""
+
+    def _ensure_broadcast_feed(self, session, symbols: List[str]) -> None:
+        token_map = self._resolve_tokens(symbols)
+        if not token_map:
+            return
+
+        socket_url = self._get_broadcast_socket(session) or DEFAULT_BROADCAST_SOCKET
+        broadcast_token = (session or {}).get("broadcast_token") or getattr(
+            self.broker, "broadcast_access_token", None
+        )
+        user_id = (session or {}).get("user") or getattr(self.broker, "user_id", None) or getattr(
+            self.broker, "user", None
+        )
+        if not broadcast_token or not user_id:
+            self._debug(
+                "broadcast:missing-creds",
+                "[LTP-BS] broadcast skip missing broadcast_token or user_id",
+                interval=30.0,
+            )
+            return
+
+        if self._broadcast_feed is None:
+            self._broadcast_feed = BearStreetBroadcastFeed(
+                on_debug=lambda msg: self._debug("broadcast", f"[LTP-BS] {msg}", interval=10.0),
+            )
+            self._broadcast_feed.start(socket_url, user_id, broadcast_token, token_map)
+            return
+
+        self._broadcast_feed.update_credentials(socket_url, user_id, broadcast_token)
+        self._broadcast_feed.update_symbols(token_map)
+
+    def _fetch_broadcast_prices(self, symbols: List[str]) -> Dict[str, float]:
+        if self._broadcast_feed is None:
+            return {}
+        cached = self._broadcast_feed.get_prices()
+        price_map: Dict[str, float] = {}
+        for sym in symbols:
+            sym = self._normalize_symbol(sym)
+            ltp = cached.get(sym)
+            if ltp is not None and ltp > 0:
+                price_map[sym] = float(ltp)
+        if price_map:
+            self._debug(
+                "broadcast:ok",
+                f"[LTP-BS] broadcast prices={price_map} connected={self._broadcast_feed.is_connected()}",
+                interval=10.0,
+            )
+        return price_map
 
     def _extract_ltp(self, row) -> Optional[float]:
         if row is None:
@@ -305,7 +386,7 @@ class BearStreetLTPPoller:
         if redis_client is None:
             return {}
 
-        now = datetime.now()
+        now = self._now_market_time()
         bar = self._shared_ltp_bar(now)
         price_map: Dict[str, float] = {}
         for sym in symbols:
@@ -336,8 +417,9 @@ class BearStreetLTPPoller:
         if self.market_client is None or not hasattr(self.market_client, "fetch_price"):
             return {}
 
-        now = datetime.now()
+        now = self._now_market_time()
         bar = self._shared_ltp_bar(now)
+        bar_dt = bar.replace(tzinfo=MARKET_TZ) if bar.tzinfo is None else bar
         price_map: Dict[str, float] = {}
         min_interval = 30.0
 
@@ -349,7 +431,7 @@ class BearStreetLTPPoller:
             try:
                 px = self.market_client.fetch_price(
                     ticker=f"{sym}.NS",
-                    target_datetime=bar,
+                    target_datetime=bar_dt,
                     candle="1m",
                 )
             except Exception as e:
@@ -472,7 +554,8 @@ class BearStreetLTPPoller:
                     time.sleep(self.poll_interval)
                     continue
 
-                price_map = self._fetch_quote_prices(self._session, symbols)
+                self._ensure_broadcast_feed(self._session, symbols)
+                price_map = self._fetch_broadcast_prices(symbols)
 
                 missing = [s for s in symbols if s not in price_map]
                 if missing:
