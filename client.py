@@ -322,22 +322,27 @@ class MarketClient:
 
     def _init_redis(self):
         try:
-            if os.environ.get("REDIS_CLUSTER", "").lower() in ("1", "true", "yes"):
-                self.redis_client = redis.RedisCluster(
-                    host=os.environ.get("REDIS_HOST", "clustercfg.mintzy-redis.ci2qc0.use1.cache.amazonaws.com"),
-                    port=int(os.environ.get("REDIS_PORT", "6379")),
-                    ssl=True,
-                    ssl_cert_reqs=None,
-                    decode_responses=True,
-                    socket_connect_timeout=5,
-                )
-            else:
-                self.redis_client = redis.Redis(
-                    host=os.environ.get("REDIS_HOST", "127.0.0.1"),
-                    port=int(os.environ.get("REDIS_PORT", "6379")),
-                    decode_responses=True,
-                    socket_connect_timeout=5,
-                )
+            redis_host_raw = os.environ.get(
+                "REDIS_HOST",
+                "clustercfg.mintzy-redis.ci2qc0.use1.cache.amazonaws.com",
+            )
+            redis_host = redis_host_raw
+            redis_port = int(os.environ.get("REDIS_PORT", "6379"))
+            if ":" in redis_host_raw:
+                redis_host, redis_port_raw = redis_host_raw.rsplit(":", 1)
+                if redis_port_raw:
+                    redis_port = int(redis_port_raw)
+
+            # AWS ElastiCache cluster mode always needs RedisCluster + TLS
+            # (same as mintzy-plugin-updated; do not use plain Redis here).
+            self.redis_client = redis.RedisCluster(
+                host=redis_host,
+                port=redis_port,
+                ssl=True,
+                ssl_cert_reqs=None,
+                decode_responses=True,
+                socket_connect_timeout=5,
+            )
             self.redis_client.ping()
             print("[MARKET CLIENT] Redis connected")
         except Exception as e:
