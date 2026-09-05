@@ -3104,7 +3104,7 @@ class AutoTrader:
                 return cached
             return self._build_pyramid_handoff_result(
                 applied=True,
-                live_allowed=True,
+                live_allowed=False,
                 reason="already_applied",
             )
 
@@ -3113,7 +3113,7 @@ class AutoTrader:
             print("[PYRAMID] configuration_id missing — skipping capital pyramid update")
             return self._build_pyramid_handoff_result(
                 applied=False,
-                live_allowed=True,
+                live_allowed=False,
                 reason="configuration_id_missing",
             )
 
@@ -3121,7 +3121,7 @@ class AutoTrader:
         if not config_doc:
             return self._build_pyramid_handoff_result(
                 applied=False,
-                live_allowed=True,
+                live_allowed=False,
                 reason="configuration_not_found",
             )
 
@@ -3130,7 +3130,7 @@ class AutoTrader:
             print(f"[PYRAMID] configuration symbols not found for {configuration_id}")
             return self._build_pyramid_handoff_result(
                 applied=False,
-                live_allowed=True,
+                live_allowed=False,
                 reason="configuration_symbols_missing",
             )
 
@@ -3140,7 +3140,7 @@ class AutoTrader:
             print("[PYRAMID] No symbols with capital to evaluate — aborting update")
             return self._build_pyramid_handoff_result(
                 applied=False,
-                live_allowed=True,
+                live_allowed=False,
                 reason="no_symbols_to_evaluate",
             )
 
@@ -3154,7 +3154,7 @@ class AutoTrader:
             print("[PYRAMID] Skipping capital pyramid — real broker/session cash unavailable")
             return self._build_pyramid_handoff_result(
                 applied=False,
-                live_allowed=True,
+                live_allowed=False,
                 reason="broker_cash_unavailable",
             )
 
@@ -3409,7 +3409,7 @@ class AutoTrader:
         return self._finish_pyramid_handoff(
             self._build_pyramid_handoff_result(
                 applied=False,
-                live_allowed=len(symbols_for_live) > 0,
+                live_allowed=False,
                 reason="mongo_save_failed",
                 profitable_count=len(symbols_for_live),
                 symbols_for_live=symbols_for_live,
@@ -5299,6 +5299,10 @@ class AutoTrader:
                     self._sleep_until_next_candle(candle)
                     continue
 
+                if self.stop_event.is_set():
+                    print(f"[SKIP] Stop requested — skipping candle {candle_key}")
+                    break
+
                 #  LOCK CANDLE IMMEDIATELY (IMPORTANT)
                 self._last_executed_candle = candle_key
 
@@ -6451,6 +6455,7 @@ class AutoTrader:
         if getattr(self, "_shutdown_done", False):
             return
         self._shutdown_done = True
+        self.stop_event.set()
         if getattr(self, "simulation_logs", False):
             print("[SHUTDOWN] Paper stop — applying capital pyramid update (no square-off)...")
             try:
@@ -6465,7 +6470,7 @@ class AutoTrader:
                 traceback.print_exc()
                 self._pyramid_handoff_result = self._build_pyramid_handoff_result(
                     applied=False,
-                    live_allowed=True,
+                    live_allowed=False,
                     reason="pyramid_exception",
                 )
         elif getattr(self, "_auto_exit_done", False):
@@ -6487,7 +6492,6 @@ class AutoTrader:
                 self._csv_logger.stop()
             except Exception as e:
                 print(f"[SHUTDOWN] AsyncCsvLogger stop failed: {e}")
-        self.stop_event.set()
 
 
         

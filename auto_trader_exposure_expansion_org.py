@@ -3687,6 +3687,10 @@ class AutoTrader:
                     self._sleep_until_next_candle(candle)
                     continue
 
+                if self.stop_event.is_set():
+                    print(f"[SKIP] Stop requested — skipping candle {candle_key}")
+                    break
+
                 #  LOCK CANDLE IMMEDIATELY (IMPORTANT)
                 self._last_executed_candle = candle_key
 
@@ -4812,6 +4816,7 @@ class AutoTrader:
         if getattr(self, "_shutdown_done", False):
             return
         self._shutdown_done = True
+        self.stop_event.set()
         if getattr(self, "_auto_exit_done", False):
             print("[SHUTDOWN] 15:00 auto-exit already completed — skip second square-off")
         else:
@@ -4831,7 +4836,6 @@ class AutoTrader:
                 self._csv_logger.stop()
             except Exception as e:
                 print(f"[SHUTDOWN] AsyncCsvLogger stop failed: {e}")
-        self.stop_event.set()
 
 
         
