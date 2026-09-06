@@ -5,3 +5,6 @@ __pycache__/
 *.env
 logs/
 .DS_Store
+venv/
+_odin_feed_probe/
+.env.example

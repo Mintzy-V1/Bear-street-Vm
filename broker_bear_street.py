@@ -70,6 +70,16 @@ class BrokerConnector:
         self.user = None
         self.debug = os.getenv("BEAR_STREET_DEBUG", "").lower() in ("1", "true", "yes")
 
+    def _broadcast_socket_url(self) -> str:
+        obj = self.obj
+        if not obj:
+            return ""
+        login_data = getattr(obj, "login_data", None)
+        others = getattr(login_data, "others", None) if login_data else None
+        if isinstance(others, dict):
+            return (others.get("broadCastSocket") or others.get("broadcastSocket") or "").strip()
+        return ""
+
     def _build_client(self):
         if not self.api_key or not self.user_id or not self.password or not self.second_auth:
             raise RuntimeError("Bear Street credentials missing (api_key, user_id, password, second_auth)")
@@ -99,6 +109,7 @@ class BrokerConnector:
                 "user": self.user,
                 "token": self.access_token,
                 "broadcast_token": self.broadcast_access_token,
+                "broadcast_socket": self._broadcast_socket_url(),
                 "obj": self.obj,
             }
         except BearStreetAuthError as ex:
@@ -131,6 +142,7 @@ class BrokerConnector:
             "user": self.user,
             "token": self.access_token,
             "broadcast_token": self.broadcast_access_token,
+            "broadcast_socket": self._broadcast_socket_url(),
             "obj": self.obj,
         }
 
@@ -152,6 +164,7 @@ class BrokerConnector:
                 "user": self.user,
                 "token": self.access_token,
                 "broadcast_token": self.broadcast_access_token,
+                "broadcast_socket": self._broadcast_socket_url(),
                 "obj": self.obj,
             }
         return self._create_session()

@@ -138,13 +138,13 @@ def connect_broker(
         clear_broker_env(bt)
 
 
-def create_ltp_stream(broker, on_tick):
+def create_ltp_stream(broker, on_tick, market_client=None):
     bt = normalize_broker_type(getattr(broker, "broker_type", BROKER_BEAR_STREET))
     if bt == BROKER_TRADEX:
         from live_ltp_ws_tradex import TradeXLTPPoller
         return TradeXLTPPoller(broker, on_tick)
     if bt == BROKER_BEAR_STREET:
         from bear_street_ltp_poller import BearStreetLTPPoller
-        return BearStreetLTPPoller(broker, on_tick)
+        return BearStreetLTPPoller(broker, on_tick, market_client=market_client)
     from live_ltp_ws import LiveLTPStream
     return LiveLTPStream(broker, on_tick)

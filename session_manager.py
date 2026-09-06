@@ -28,9 +28,29 @@ SIMULATION_STOP_PREFIX = "autotrader:simulation_stop:"
 SIMULATION_STOP_TTL = 300
 PYRAMID_RESULT_PREFIX = "autotrader:pyramid_result:"
 PYRAMID_RESULT_TTL = 600
+STOP_JOB_PREFIX = "autotrader:stop_job:"
+STOP_JOB_TTL = 600
+
+# Live handoff is blocked unless pyramid sets live_allowed=True explicitly.
+_PYRAMID_HANDOFF_BLOCKED = {
+    "applied": False,
+    "live_allowed": False,
+    "reason": "pyramid_not_run",
+    "profitable_count": 0,
+    "symbols_for_live": [],
+}
 
 
-
+def _signal_trader_stop(trader, stop_event, session_id: str, reason: str) -> None:
+    """
+    First action on any stop path: halt the trader loop before pyramid/shutdown.
+    Sets trader threading.Event first, then the worker multiprocessing.Event.
+    Both .set() calls are idempotent.
+    """
+    if trader is not None and hasattr(trader, "stop_event"):
+        trader.stop_event.set()
+        print(f"[Worker-{session_id}] trader.stop_event set ({reason})")
+    stop_event.set()
 
 
 class WorkerProcess:
@@ -79,10 +99,13 @@ def _trader_worker(
     Isolated from other traders - has its own Python interpreter and memory space.
     """
     import signal
+
+    trader_holder: Dict[str, Any] = {"trader": None}
+
     def handle_sigterm(signum, frame):
-        print(f"[Worker-{session_id}] SIGTERM mila Ã¢â‚¬â€ graceful shutdown...")
-        stop_event.set()   # Ã¢â€ Â stop_event set kar do Ã¢â‚¬â€ baaki sab automatically hoga
-    
+        print(f"[Worker-{session_id}] SIGTERM mila — graceful shutdown...")
+        _signal_trader_stop(trader_holder["trader"], stop_event, session_id, "SIGTERM")
+
     signal.signal(signal.SIGTERM, handle_sigterm)
 
     try:
@@ -183,13 +206,14 @@ def _trader_worker(
         trader.initial_allocations = allocations
         trader.configuration_id = configuration_id
         trader.simulation_logs = bool(simulation_logs)
-        try:
-            trader.leverage_multiplier = float(leverage_multiplier) if leverage_multiplier is not None else 1.0
-            if trader.leverage_multiplier <= 0:
-                trader.leverage_multiplier = 1.0
-        except (TypeError, ValueError):
-            trader.leverage_multiplier = 1.0
-        
+        if leverage_multiplier is not None:
+            try:
+                trader.leverage_multiplier = float(leverage_multiplier)
+            except (TypeError, ValueError):
+                trader.leverage_multiplier = None
+
+        trader_holder["trader"] = trader
+
         # Signal that we're healthy and starting
         health_queue.put({
             "session_id": session_id,
@@ -236,7 +260,11 @@ def _trader_worker(
                 f"broker={getattr(broker, 'broker_type', 'unknown')} "
                 f"symbols={list(allocations.keys())}"
             )
-            ltp_stream = create_ltp_stream(broker, trader.on_ltp_tick)
+            ltp_stream = create_ltp_stream(
+                broker,
+                trader.on_ltp_tick,
+                market_client=getattr(trader, "market_client", None),
+            )
             ltp_stream.start(list(allocations.keys()))
             print(f"[Worker-{session_id}] LiveLTPStream started for {len(allocations)} symbols")
         except Exception as e:
@@ -244,7 +272,18 @@ def _trader_worker(
 
         # Monitor for stop signal AND single-symbol exit requests
         exit_queue_key = f"autotrader:exit_request:{session_id}"
+        sim_stop_key = f"{SIMULATION_STOP_PREFIX}{session_id}"
         while trader_thread.is_alive() and not stop_event.is_set():
+            if exit_redis_client:
+                try:
+                    if exit_redis_client.get(sim_stop_key):
+                        _signal_trader_stop(
+                            trader, stop_event, session_id, "redis simulation_stop"
+                        )
+                        break
+                except Exception as e:
+                    print(f"[Worker-{session_id}] Simulation stop flag check error: {e}")
+
             # Check for single-symbol exit requests from Redis
             if exit_redis_client:
                 try:
@@ -263,22 +302,24 @@ def _trader_worker(
             
             trader_thread.join(timeout=1)
         
+        handoff = None
         # If stop was requested, shutdown trader
         if stop_event.is_set():
             print(f"[Worker-{session_id}] Stop requested, shutting down...")
-            trader.shutdown() # but inside the shutdown we have not write the logic of exiting the orders and all and in the while loop we have not checked the stop_event flag
+            _signal_trader_stop(trader, stop_event, session_id, "worker stop monitor")
+            trader_thread.join(timeout=45)
+            if trader_thread.is_alive():
+                print(
+                    f"[Worker-{session_id}] trader_thread still alive after 45s "
+                    "— proceeding with shutdown"
+                )
+            trader.shutdown()
             print("shutdown called successfully")
             trader_thread.join(timeout=60)
 
             handoff = getattr(trader, "_pyramid_handoff_result", None)
             if handoff is None:
-                handoff = {
-                    "applied": False,
-                    "live_allowed": True,
-                    "reason": "pyramid_not_run",
-                    "profitable_count": 0,
-                    "symbols_for_live": [],
-                }
+                handoff = dict(_PYRAMID_HANDOFF_BLOCKED)
             if exit_redis_client:
                 try:
                     exit_redis_client.setex(
@@ -332,6 +373,18 @@ def _trader_worker(
                 print(f"[Worker-{session_id}] Simulation stopped in Mongo (session auth unchanged)")
             except Exception as e:
                 print(f"[Worker-{session_id}] Failed to mark simulation stopped in Mongo: {e}")
+
+            if stop_event.is_set():
+                try:
+                    if handoff is None:
+                        handoff = dict(_PYRAMID_HANDOFF_BLOCKED)
+                    SessionManager.complete_stop_job(
+                        session_id,
+                        handoff,
+                        simulation_stop=True,
+                    )
+                except Exception as job_err:
+                    print(f"[Worker-{session_id}] Failed to update stop job in Redis: {job_err}")
         else:
             health_queue.put({
                 "session_id": session_id,
@@ -362,6 +415,12 @@ def _trader_worker(
     except Exception as e:
         error_msg = f"Worker error: {str(e)}\n{traceback.format_exc()}"
         print(f"[Worker-{session_id}] {error_msg}")
+        try:
+            existing_job = SessionManager.read_stop_job(session_id)
+            if existing_job and existing_job.get("status") == "stopping":
+                SessionManager.fail_stop_job(session_id, error_msg)
+        except Exception:
+            pass
         health_queue.put({
             "session_id": session_id,
             "status": "error",
@@ -375,7 +434,7 @@ class SessionManager:
     Optimized session manager using multiprocessing for true parallelism.
     Each trader runs in its own process with isolated resources.
     """
-    
+     
     _workers: Dict[str, WorkerProcess] = {}
     _manager = None
     _health_queue = None
@@ -403,6 +462,107 @@ class SessionManager:
     SIMULATION_STOP_TTL = SIMULATION_STOP_TTL
     PYRAMID_RESULT_PREFIX = PYRAMID_RESULT_PREFIX
     PYRAMID_RESULT_TTL = PYRAMID_RESULT_TTL
+    STOP_JOB_PREFIX = STOP_JOB_PREFIX
+    STOP_JOB_TTL = STOP_JOB_TTL
+
+    @classmethod
+    def _stop_job_key(cls, session_id: str) -> str:
+        return f"{cls.STOP_JOB_PREFIX}{session_id}"
+
+    @classmethod
+    def read_stop_job(cls, session_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            raw = cls._redis().get(cls._stop_job_key(session_id))
+            if not raw:
+                return None
+            return json.loads(raw)
+        except Exception as e:
+            print(f"[SessionManager] Failed to read stop job for {session_id}: {e}")
+            return None
+
+    @classmethod
+    def init_stop_job(cls, session_id: str, **fields) -> Dict[str, Any]:
+        job = {
+            "session_id": session_id,
+            "status": "stopping",
+            "phase": "queued",
+            "started_at": time.time(),
+            "completed_at": None,
+            "live_allowed": None,
+            "pyramid": None,
+            "error": None,
+            "finalized": False,
+            "response": None,
+        }
+        job.update(fields)
+        try:
+            cls._redis().setex(
+                cls._stop_job_key(session_id),
+                cls.STOP_JOB_TTL,
+                json.dumps(job),
+            )
+            print(f"[SessionManager] Stop job initialized for {session_id} status={job['status']}")
+        except Exception as e:
+            print(f"[SessionManager] Failed to init stop job for {session_id}: {e}")
+        return job
+
+    @classmethod
+    def update_stop_job(cls, session_id: str, **fields) -> Optional[Dict[str, Any]]:
+        job = cls.read_stop_job(session_id) or {
+            "session_id": session_id,
+            "started_at": time.time(),
+            "status": "stopping",
+            "phase": "queued",
+        }
+        job.update(fields)
+        try:
+            cls._redis().setex(
+                cls._stop_job_key(session_id),
+                cls.STOP_JOB_TTL,
+                json.dumps(job),
+            )
+        except Exception as e:
+            print(f"[SessionManager] Failed to update stop job for {session_id}: {e}")
+            return None
+        return job
+
+    @classmethod
+    def complete_stop_job(
+        cls,
+        session_id: str,
+        handoff: Dict[str, Any],
+        *,
+        simulation_stop: bool = True,
+    ) -> None:
+        cls.update_stop_job(
+            session_id,
+            status="completed",
+            phase="done",
+            completed_at=time.time(),
+            live_allowed=bool(handoff.get("live_allowed", False)),
+            pyramid=handoff,
+            simulation_stop=simulation_stop,
+            trading_status=(
+                "simulation_stopped"
+                if simulation_stop and bool(handoff.get("live_allowed", False))
+                else "stopped"
+            ),
+        )
+        print(
+            f"[SessionManager] Stop job completed for {session_id} "
+            f"live_allowed={handoff.get('live_allowed')}"
+        )
+
+    @classmethod
+    def fail_stop_job(cls, session_id: str, error: str) -> None:
+        cls.update_stop_job(
+            session_id,
+            status="failed",
+            phase="failed",
+            completed_at=time.time(),
+            error=str(error)[:2000],
+        )
+        print(f"[SessionManager] Stop job failed for {session_id}: {error}")
 
     @classmethod
     def _pyramid_result_key(cls, session_id: str) -> str:
@@ -455,6 +615,17 @@ class SessionManager:
             return True
 
     @classmethod
+    def _get_redis_pid(cls, session_id: str) -> Optional[int]:
+        try:
+            redis_client = cls._redis()
+            if not redis_client:
+                return None
+            pid_str = redis_client.get(f"{cls.REDIS_KEY_PREFIX}{session_id}")
+            return int(pid_str) if pid_str else None
+        except Exception:
+            return None
+
+    @classmethod
     def _wait_for_pid_exit(cls, pid: int, timeout: float = 90.0) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -464,8 +635,65 @@ class SessionManager:
         return not cls._pid_alive(pid)
 
     @classmethod
+    def _reconcile_session_registry(cls, session_id: str) -> None:
+        """
+        Drop stale local/Redis/PID-file worker entries before start/stop decisions.
+        This keeps simulation-to-live handoff from being blocked by dead local
+        worker objects or stale PID tracking.
+        """
+        worker = cls._workers.get(session_id)
+        redis_pid = cls._get_redis_pid(session_id)
+
+        if worker and not worker.is_alive():
+            print(f"[SessionManager] Reconcile: dead local worker for {session_id}")
+            cls._cleanup_worker(session_id)
+            worker = None
+
+        if worker and worker.is_alive():
+            local_pid = worker.process.pid
+            if redis_pid is None:
+                print(
+                    f"[SessionManager] Reconcile: local worker PID={local_pid} for {session_id} "
+                    "but Redis entry is missing - cleaning local worker"
+                )
+                worker.stop_event.set()
+                worker.process.join(timeout=5)
+                if worker.is_alive():
+                    try:
+                        worker.process.terminate()
+                        worker.process.join(timeout=3)
+                    except Exception:
+                        pass
+                cls._cleanup_worker(session_id)
+            elif redis_pid != local_pid:
+                print(
+                    f"[SessionManager] Reconcile: PID mismatch local={local_pid} redis={redis_pid} "
+                    f"for {session_id} - cleaning local registry"
+                )
+                cls._cleanup_worker(session_id)
+
+        redis_pid = cls._get_redis_pid(session_id)
+        if redis_pid is not None and not cls._pid_alive(redis_pid):
+            print(f"[SessionManager] Reconcile: Redis PID={redis_pid} for {session_id} is dead - clearing")
+            try:
+                redis_client = cls._redis()
+                if redis_client:
+                    redis_client.delete(f"{cls.REDIS_KEY_PREFIX}{session_id}")
+            except Exception as e:
+                print(f"[SessionManager] Redis delete failed during reconcile: {e}")
+            cls._workers.pop(session_id, None)
+
+        file_pid = cls._read_worker_pid_file(session_id)
+        if file_pid is not None and not cls._pid_alive(file_pid):
+            print(f"[SessionManager] Reconcile: PID file PID={file_pid} for {session_id} is dead - clearing")
+            cls._clear_worker_pid_file(session_id)
+            cls._clear_worker_pid(session_id)
+
+    @classmethod
     def ensure_worker_stopped(cls, session_id: str, timeout: float = 90.0) -> bool:
         """Block until no live worker remains for this session (local registry + PID lookup)."""
+        cls._reconcile_session_registry(session_id)
+
         worker = cls._workers.get(session_id)
         if worker and worker.is_alive():
             print(f"[SessionManager] ensure_worker_stopped: signaling local worker {session_id}")
@@ -479,10 +707,30 @@ class SessionManager:
                     pass
             cls._cleanup_worker(session_id)
 
-        pid = cls._resolve_worker_pid(session_id)
-        if pid and cls._pid_alive(pid):
-            print(f"[SessionManager] ensure_worker_stopped: terminating PID={pid} for {session_id}")
-            cls._terminate_pid(pid)
+        redis_pid = cls._get_redis_pid(session_id)
+        if redis_pid and cls._pid_alive(redis_pid):
+            print(f"[SessionManager] ensure_worker_stopped: terminating Redis PID={redis_pid} for {session_id}")
+            cls._terminate_pid(redis_pid)
+            if not cls._wait_for_pid_exit(redis_pid, timeout):
+                print(f"[SessionManager] ensure_worker_stopped: Redis PID={redis_pid} still alive for {session_id}")
+                return False
+
+        fallback_pid = cls._resolve_worker_pid(session_id)
+        if fallback_pid and fallback_pid != redis_pid and cls._pid_alive(fallback_pid):
+            print(f"[SessionManager] ensure_worker_stopped: terminating fallback PID={fallback_pid} for {session_id}")
+            cls._terminate_pid(fallback_pid)
+            if not cls._wait_for_pid_exit(fallback_pid, timeout):
+                print(f"[SessionManager] ensure_worker_stopped: fallback PID={fallback_pid} still alive for {session_id}")
+                return False
+
+        cls._reconcile_session_registry(session_id)
+        final_pid = cls._resolve_worker_pid(session_id)
+        still_running = session_id in cls._workers or (
+            final_pid is not None and cls._pid_alive(final_pid)
+        )
+        if still_running:
+            print(f"[SessionManager] ensure_worker_stopped: worker still alive for {session_id}")
+            return False
 
         redis_client = cls._redis()
         if redis_client:
@@ -494,13 +742,6 @@ class SessionManager:
         cls._clear_worker_pid_file(session_id)
         cls._workers.pop(session_id, None)
 
-        pid = cls._resolve_worker_pid(session_id)
-        still_running = session_id in cls._workers or (
-            pid is not None and cls._pid_alive(pid)
-        )
-        if still_running:
-            print(f"[SessionManager] ensure_worker_stopped: worker still alive for {session_id}")
-            return False
         print(f"[SessionManager] ensure_worker_stopped: {session_id} is clear")
         return True
 
@@ -702,7 +943,18 @@ class SessionManager:
             os.kill(pid, signal.SIGTERM)
             print(f"[SessionManager] SIGTERM sent to PID={pid}")
 
-            import psutil
+            try:
+                import psutil
+            except ImportError:
+                print("[SessionManager] psutil not installed - polling PID until exit")
+                if not cls._wait_for_pid_exit(pid, timeout=90):
+                    print(f"[SessionManager] PID={pid} still alive after 90s, sending SIGKILL")
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    return cls._wait_for_pid_exit(pid, timeout=10)
+                return True
 
             try:
                 proc = psutil.Process(pid)
@@ -711,6 +963,7 @@ class SessionManager:
             except psutil.TimeoutExpired:
                 print(f"[SessionManager] PID={pid} still alive after 60s, sending SIGKILL")
                 os.kill(pid, signal.SIGKILL)
+                return cls._wait_for_pid_exit(pid, timeout=10)
             except psutil.NoSuchProcess:
                 print(f"[SessionManager] Process {pid} already exited")
             return True
@@ -727,12 +980,24 @@ class SessionManager:
         
         # Start monitor if not running
         cls._start_monitor()
-        
+
+        cls._reconcile_session_registry(session_id)
+
         # Check if session already exists
         if session_id in cls._workers:
-            print(f"[SessionManager] Session already running: {session_id}")
+            worker = cls._workers[session_id]
+            if not worker.is_alive():
+                print(f"[SessionManager] Stale worker registry for {session_id} - cleaning up")
+                cls._cleanup_worker(session_id)
+            else:
+                print(f"[SessionManager] Session already running: {session_id}")
+                raise RuntimeError(f"Session {session_id} is already running")
+
+        redis_pid = cls._get_redis_pid(session_id)
+        if redis_pid is not None and cls._pid_alive(redis_pid):
+            print(f"[SessionManager] Session already running (Redis PID={redis_pid}): {session_id}")
             raise RuntimeError(f"Session {session_id} is already running")
-        
+
         # Check worker limit
         active_workers = sum(1 for w in cls._workers.values() if w.is_alive())
         if active_workers >= cls.MAX_WORKERS:
@@ -891,10 +1156,45 @@ class SessionManager:
 
 
     @classmethod
+    def stop_session_signal_only(cls, session_id: str) -> bool:
+        """
+        Signal the trading worker to stop without blocking for process exit.
+        Safe to call from any gunicorn worker (local mp.Event or cross-worker SIGTERM).
+        """
+        print(f"[SessionManager] stop_session_signal_only: '{session_id}'")
+        worker = cls._workers.get(session_id)
+
+        if worker:
+            print(f"[SessionManager] Signal-only local worker for {session_id}")
+            worker.stop_event.set()
+            return True
+
+        try:
+            pid_str = cls._redis().get(f"{cls.REDIS_KEY_PREFIX}{session_id}")
+            if not pid_str:
+                print(
+                    f"[SessionManager] Signal-only: no local worker or Redis PID for {session_id} "
+                    "— worker may already be stopped"
+                )
+                return True
+
+            pid = int(pid_str)
+            print(f"[SessionManager] Signal-only SIGTERM PID={pid} for {session_id}")
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                print(f"[SessionManager] Signal-only: PID={pid} already exited")
+            return True
+        except Exception as e:
+            print(f"[SessionManager] Signal-only stop failed for {session_id}: {e}")
+            return False
+
+    @classmethod
     def stop_session(cls, session_id: str):
         print(f"[SessionManager] Stop request aaya: '{session_id}'")
         print(f"[SessionManager] Current workers: {list(cls._workers.keys())}")
 
+        cls._reconcile_session_registry(session_id)
         worker = cls._workers.get(session_id)
 
         if not worker:
@@ -902,13 +1202,18 @@ class SessionManager:
             pid = cls._resolve_worker_pid(session_id)
 
             if not pid:
-                print(f"[SessionManager] No worker PID found — treating as already stopped")
+                print(f"[SessionManager] No worker PID found - nothing stopped")
                 cls._clear_worker_pid(session_id)
                 cls._clear_worker_pid_file(session_id)
-                return True
+                return False
 
             print(f"[SessionManager] PID={pid} mila — terminate kar raha hoon...")
             stopped = cls._terminate_pid(pid)
+            if stopped and cls._pid_alive(pid):
+                stopped = cls._wait_for_pid_exit(pid, timeout=90)
+            if not stopped:
+                print(f"[SessionManager] PID={pid} did not stop cleanly for {session_id}")
+                return False
 
             redis_client = cls._redis()
             if redis_client:
@@ -933,6 +1238,11 @@ class SessionManager:
             worker.process.join(timeout=5)
             if worker.is_alive():
                 worker.process.kill()
+                worker.process.join(timeout=5)
+
+        if worker.is_alive():
+            print(f"[SessionManager] Worker still alive after stop attempt: {session_id}")
+            return False
 
         redis_client = cls._redis()
         if redis_client:
@@ -948,9 +1258,40 @@ class SessionManager:
         return True
 
     @classmethod
+    def stop_simulation_session_async(cls, session_id: str) -> bool:
+        """
+        Non-blocking simulation stop: set flags, signal worker, return immediately.
+        Worker completes pyramid/shutdown in background and updates Redis stop job.
+        """
+        print(f"[SessionManager] Async simulation stop request: '{session_id}'")
+        existing = cls.read_stop_job(session_id)
+        if existing and existing.get("status") in ("stopping", "completed"):
+            print(
+                f"[SessionManager] Stop job already {existing.get('status')} for {session_id} "
+                "— idempotent accept"
+            )
+            return True
+
+        if not cls._mark_simulation_stop(session_id):
+            print(
+                f"[SessionManager] Simulation stop aborted for {session_id} "
+                "— Redis simulation-stop flag was not set"
+            )
+            return False
+
+        cls.init_stop_job(session_id, status="stopping", phase="signal_sent")
+
+        if not cls.stop_session_signal_only(session_id):
+            cls.fail_stop_job(session_id, "Failed to signal simulation worker")
+            return False
+
+        cls.update_stop_job(session_id, phase="waiting_worker")
+        return True
+
+    @classmethod
     def stop_simulation_session(cls, session_id: str):
         """
-        Stop the paper/simulation worker without marking the session as stopped.
+        Blocking simulation stop (legacy / ?wait=true).
         Sets a Redis flag so the worker exit handler keeps status=authenticated in Mongo.
         """
         print(f"[SessionManager] Simulation stop request: '{session_id}'")
@@ -960,13 +1301,18 @@ class SessionManager:
                 "— Redis simulation-stop flag was not set"
             )
             return False
+        cls.init_stop_job(session_id, status="stopping", phase="blocking_stop")
         stopped = cls.stop_session(session_id)
         cls._cleanup_worker(session_id)
         if stopped:
             fully_stopped = cls.ensure_worker_stopped(session_id, timeout=90)
             if not fully_stopped:
                 print(f"[SessionManager] Simulation worker for {session_id} did not exit in time")
+                cls.fail_stop_job(session_id, "Worker did not exit in time")
                 return False
+        if stopped:
+            handoff = cls.read_pyramid_handoff_result(session_id) or dict(_PYRAMID_HANDOFF_BLOCKED)
+            cls.complete_stop_job(session_id, handoff, simulation_stop=True)
         return stopped
     
     @classmethod

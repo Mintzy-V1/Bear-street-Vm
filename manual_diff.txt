@@ -1,0 +1,1134 @@
+/api/trading/start-simulation differences between Bear Street and reference
+
+Compared files:
+- Bear Street: C:\Users\Hp\Desktop\mintzy-bear-street\api_server.py
+- Reference: C:\Users\Hp\Desktop\mintzy-plugin-updated\api_server.py
+
+1. Endpoint route and function signature
+
+Both repos expose the same endpoint:
+
+@app.post("/api/trading/start-simulation")
+async def start_trading_simulation(config: TradingConfig, x_plugin_api_key: str = Header(None)):
+
+Reference location:
+mintzy-plugin-updated/api_server.py:2398
+
+Bear Street location:
+mintzy-bear-street/api_server.py:2407
+
+2. Docstring difference
+
+Reference says:
+- Start paper simulation with the same payload as /api/trading/start.
+- Always uses strategy B.
+
+Bear Street says:
+- Start paper simulation with the same payload as /api/trading/start.
+- Forces strategy B and simulation_logs=True.
+- Live /api/trading/start with strategy B remains live Bear Street trading.
+
+3. Main code difference
+
+Reference only forces strategy B:
+
+sim_config = config.model_copy(update={"strategy": "B"})
+
+Reference location:
+mintzy-plugin-updated/api_server.py:2414
+
+Bear Street forces strategy B and also forces simulation_logs=True:
+
+sim_config = config.model_copy(update={"strategy": "B", "simulation_logs": True})
+
+Bear Street location:
+mintzy-bear-street/api_server.py:2424
+
+4. Logging difference
+
+Bear Street logs this extra normalized field:
+
+simulation_logs=True
+
+Bear Street location:
+mintzy-bear-street/api_server.py:2429
+
+The reference repo does not log this field in /start-simulation because its endpoint does not set simulation_logs.
+
+5. Why this matters
+
+Both endpoints call:
+
+result = await start_trading(sim_config, x_plugin_api_key)
+
+But the simulation-mode decision inside start_trading is different.
+
+Reference:
+
+is_simulation_start = config.strategy == "B"
+
+Reference location:
+mintzy-plugin-updated/api_server.py:1973
+
+Bear Street:
+
+is_simulation_start = bool(config.simulation_logs)
+
+Bear Street location:
+mintzy-bear-street/api_server.py:2000
+
+6. Practical conclusion
+
+For /api/trading/start-simulation, Bear Street should still start simulation correctly because the endpoint explicitly sends:
+
+strategy = "B"
+simulation_logs = True
+
+The difference is compatibility with direct /api/trading/start calls:
+
+- Reference treats strategy B as simulation.
+- Bear Street treats simulation_logs=True as simulation.
+- In Bear Street, strategy B alone is not enough to enter simulation mode.
+
+
+start_trading() differences between Bear Street and reference
+
+Compared files:
+- Bear Street: C:\Users\Hp\Desktop\mintzy-bear-street\api_server.py
+- Reference: C:\Users\Hp\Desktop\mintzy-plugin-updated\api_server.py
+
+1. Function location
+
+Reference:
+mintzy-plugin-updated/api_server.py:1969
+
+Bear Street:
+mintzy-bear-street/api_server.py:1996
+
+2. Main simulation detection difference
+
+Reference:
+
+is_simulation_start = config.strategy == "B"
+
+Reference location:
+mintzy-plugin-updated/api_server.py:1973
+
+Bear Street:
+
+is_simulation_start = bool(config.simulation_logs)
+
+Bear Street location:
+mintzy-bear-street/api_server.py:2000
+
+This is the biggest behavior difference.
+
+In the reference repo, strategy B means simulation.
+In Bear Street, simulation_logs=True means simulation.
+
+3. TradingConfig support
+
+Reference TradingConfig does not have a simulation_logs field.
+
+Bear Street TradingConfig has:
+
+simulation_logs: Optional[bool] = Field(
+    default=None,
+    description="True for paper simulation. Live /api/trading/start leaves this unset/false.",
+)
+
+Bear Street location:
+mintzy-bear-street/api_server.py:1407
+
+4. Early session_store difference
+
+Reference stores these fields early:
+
+- strategy
+- symbols
+- configuration_id, if present
+- leverage_multiplier, if present
+
+Bear Street stores the same fields and also stores:
+
+- simulation_logs
+
+Bear Street location:
+mintzy-bear-street/api_server.py:2044
+
+5. Early DB persistence difference
+
+Reference early_persist contains:
+
+- strategy
+- symbols
+- configuration_id, if present
+- leverage_multiplier, if present
+
+Bear Street early_persist contains the same fields and also:
+
+- simulation_logs
+
+Bear Street location:
+mintzy-bear-street/api_server.py:2049
+
+6. Early simulation logging difference
+
+Reference logs early persistence timing when is_simulation_start is true:
+
+start_trading phase=persist_session_metadata_sync (early)
+
+Reference location:
+mintzy-plugin-updated/api_server.py:2029
+
+Bear Street does not have that specific early timing log.
+
+7. Authentication check
+
+Both repos require:
+
+session_data.get("status") == "authenticated"
+
+Reference location:
+mintzy-plugin-updated/api_server.py:2056
+
+Bear Street location:
+mintzy-bear-street/api_server.py:2076
+
+8. Authentication failure logging difference
+
+Reference logs a simulation-specific abort event when the session is not authenticated:
+
+start_trading ABORT not authenticated
+
+Reference location:
+mintzy-plugin-updated/api_server.py:2057
+
+Bear Street only prints the normal debug line and raises the same 401.
+
+9. Fund check difference
+
+Reference has the broker cash insufficient-funds check commented out:
+
+# Disabled: pyramided live allocations can exceed raw RMS free_cash (leverage applied in pyramid only).
+# if config.use_broker_cash and free_cash > 0 and total_allocated > free_cash:
+
+Reference location:
+mintzy-plugin-updated/api_server.py:2082
+
+Bear Street has the insufficient-funds check active for live starts:
+
+if (not is_simulation_start) and config.use_broker_cash and free_cash > 0 and total_allocated > free_cash:
+
+Bear Street location:
+mintzy-bear-street/api_server.py:2095
+
+Impact:
+- In Bear Street, simulation skips this check only when simulation_logs=True.
+- Direct /api/trading/start with strategy B but without simulation_logs=True is treated as live and can be blocked by this cash check.
+
+10. Worker live/simulation decision difference
+
+Reference:
+
+is_live_start = config.strategy != "B"
+
+Reference location:
+mintzy-plugin-updated/api_server.py:2296
+
+Bear Street:
+
+is_live_start = not is_simulation_start
+
+Bear Street location:
+mintzy-bear-street/api_server.py:2302
+
+Impact:
+- For /api/trading/start-simulation, both behave as simulation.
+- For direct /api/trading/start with strategy B, reference treats it as simulation but Bear Street treats it as live unless simulation_logs=True is present.
+
+11. Already-running simulation difference
+
+Both repos return success if the worker is already running for a simulation-type start.
+
+Reference additionally logs:
+
+start_trading idempotent already running
+
+Reference location:
+mintzy-plugin-updated/api_server.py:2337
+
+Bear Street returns the same kind of success response, but does not have that simulation-specific log.
+
+Bear Street location:
+mintzy-bear-street/api_server.py:2342
+
+12. Post-worker status persistence difference
+
+Reference returns success after worker start, but does not actively set these fields in this visible section:
+
+- sessions_store[session_id]["status"] = "trading_active"
+- trading_status[session_id] = {...}
+- persist status/trading_status/trading_started_at
+
+Bear Street does set those fields:
+
+sessions_store[session_id]["status"] = "trading_active"
+trading_status[session_id] = {
+    "status": "running",
+    ...
+}
+
+Bear Street locations:
+mintzy-bear-street/api_server.py:2359
+mintzy-bear-street/api_server.py:2360
+
+Bear Street also persists:
+
+- status = trading_active
+- trading_status = running
+- trading_started_at
+- strategy
+- symbols
+- time_frame
+- candle
+- simulation_logs
+
+Bear Street location:
+mintzy-bear-street/api_server.py:2368
+
+13. Final success logging difference
+
+Reference logs a simulation-specific final success event:
+
+start_trading EXIT success
+
+Reference location:
+mintzy-plugin-updated/api_server.py:2379
+
+Bear Street does not have that specific final simulation log.
+
+14. Practical conclusion
+
+For /api/trading/start-simulation:
+
+Bear Street is logically okay because the endpoint forces:
+
+strategy = "B"
+simulation_logs = True
+
+So start_trading() sees is_simulation_start=True.
+
+For direct /api/trading/start:
+
+- Reference treats strategy B as simulation.
+- Bear Street treats simulation_logs=True as simulation.
+- In Bear Street, strategy B alone is not enough to enter simulation mode.
+
+This appears intentional in Bear Street because /api/trading/start-simulation explicitly says:
+
+Live /api/trading/start with strategy B remains live Bear Street trading.
+
+
+SessionManager.start_session() differences between Bear Street and reference
+
+Compared files:
+- Bear Street: C:\Users\Hp\Desktop\mintzy-bear-street\session_manager.py
+- Reference: C:\Users\Hp\Desktop\mintzy-plugin-updated\session_manager.py
+
+Today's issue context:
+This section highlights which differences are important for the simulation-to-live switching issue seen today, 2026-09-01.
+
+1. IMPORTANT - stale worker cleanup before start
+
+Reference:
+The reference repo calls:
+
+cls._reconcile_session_registry(session_id)
+
+Reference location:
+mintzy-plugin-updated/session_manager.py:639
+
+This happens before checking whether the session is already running.
+
+Bear Street:
+Bear Street does not call an equivalent reconcile step at the start of start_session().
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:725
+
+Why this is important:
+If the session registry has stale local worker state, the reference repo can clean it before deciding whether to start a worker.
+Bear Street can raise "Session already running" immediately if the session_id exists in _workers, even if that worker is stale/dead.
+
+Today's issue relevance:
+IMPORTANT / POSSIBLE CAUSE.
+This can affect the 1 PM switch if Bear Street tries to start live trading after simulation but still has stale worker state from the simulation process.
+
+2. IMPORTANT - Redis PID duplicate check before start
+
+Reference:
+The reference repo checks Redis for an existing PID:
+
+redis_pid = cls._get_redis_pid(session_id)
+if redis_pid is not None and cls._pid_alive(redis_pid):
+    raise RuntimeError(f"Session {session_id} is already running")
+
+Reference location:
+mintzy-plugin-updated/session_manager.py:651
+
+Bear Street:
+Bear Street does not perform this Redis PID duplicate check inside start_session().
+
+Why this is important:
+In multi-process or restarted API-server flows, local memory may not know that another worker is already running.
+The reference repo uses Redis as cross-process protection before spawning a new worker.
+Bear Street only checks local _workers before starting.
+
+Today's issue relevance:
+IMPORTANT / POSSIBLE CAUSE.
+This can create duplicate-worker risk or incorrect "already running" behavior around simulation stop and live start.
+
+3. IMPORTANT - local existing worker handling
+
+Reference:
+If _workers contains the session_id, the reference checks whether the worker is alive.
+If it is dead, the reference cleans it up:
+
+if not worker.is_alive():
+    cls._cleanup_worker(session_id)
+else:
+    raise RuntimeError(f"Session {session_id} is already running")
+
+Reference location:
+mintzy-plugin-updated/session_manager.py:642
+
+Bear Street:
+Bear Street immediately raises if session_id exists in _workers:
+
+if session_id in cls._workers:
+    print(f"[SessionManager] Session already running: {session_id}")
+    raise RuntimeError(f"Session {session_id} is already running")
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:732
+
+Why this is important:
+Bear Street does not distinguish between a real active worker and stale dead worker at this point.
+
+Today's issue relevance:
+IMPORTANT / POSSIBLE CAUSE.
+If the simulation worker stopped but stale state remained in _workers, live start could fail with "already running".
+
+4. IMPORTANT BUT LIKELY NOT THE DIRECT CAUSE - simulation mode flag
+
+Reference worker sets:
+
+trader.simulation_logs = strategy == "B"
+
+Reference location:
+mintzy-plugin-updated/session_manager.py:175
+
+Bear Street worker sets:
+
+trader.simulation_logs = bool(simulation_logs)
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:185
+
+Why this is important:
+The reference repo treats strategy B as simulation.
+Bear Street treats simulation_logs=True as simulation.
+
+Today's issue relevance:
+IMPORTANT DESIGN DIFFERENCE, but likely not the direct cause if the flow used /api/trading/start-simulation, because Bear Street forces simulation_logs=True there.
+
+Risk case:
+Direct /api/trading/start with strategy B but without simulation_logs=True behaves differently:
+- Reference treats it as simulation.
+- Bear Street treats it as live.
+
+5. IMPORTANT - live/simulation worker replacement behavior
+
+Reference:
+The reference combines strategy-based simulation detection with stronger stale-worker cleanup before spawning a process.
+
+Bear Street:
+Bear Street uses simulation_logs-based detection, but does not do the same pre-start stale registry and Redis PID reconciliation inside start_session().
+
+Today's issue relevance:
+IMPORTANT / POSSIBLE CAUSE.
+During 1 PM handoff, the sequence is:
+
+1. Stop simulation worker.
+2. Restore session as authenticated.
+3. Start live worker.
+
+If the old simulation worker is still visible through local memory, Redis, or PID state, the reference has stronger protection before start_session().
+Bear Street is more likely to fail or behave inconsistently in that transition.
+
+6. Normal Bear adaptation - broker config
+
+Reference:
+Builds Angel-specific broker config manually:
+
+- api_key
+- client_code
+- password
+- broker_session
+- free_cash
+
+Reference location:
+mintzy-plugin-updated/session_manager.py:709
+
+Bear Street:
+Uses:
+
+broker_config = broker_config_from_session(session_doc)
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:790
+
+Today's issue relevance:
+NOT A LIKELY CAUSE.
+This looks like a normal Bear Street broker adaptation.
+
+7. Normal Bear adaptation - broker restore
+
+Reference:
+Uses Angel-specific BrokerConnector and Angel env vars.
+
+Bear Street:
+Uses generic:
+
+broker, restored = connect_broker(broker_config, restore=True)
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:89
+
+Today's issue relevance:
+NOT A LIKELY CAUSE by itself.
+This is expected for Bear Street.
+
+8. Normal Bear adaptation - prediction config
+
+Reference:
+Uses PREDICTION_BASE_URL.
+
+Bear Street:
+Uses PREDICTION_API_URL and PREDICTION_API_KEY.
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:117
+
+Today's issue relevance:
+NOT A LIKELY CAUSE unless prediction API env values are wrong.
+
+9. Normal Bear adaptation - LTP stream
+
+Reference:
+Uses:
+
+LiveLTPStream(broker, trader.on_ltp_tick)
+
+Reference location:
+mintzy-plugin-updated/session_manager.py:228
+
+Bear Street:
+Uses:
+
+create_ltp_stream(broker, trader.on_ltp_tick)
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:239
+
+Today's issue relevance:
+NOT A LIKELY CAUSE for start_session failure.
+Could affect live price updates after live starts, but not the core start/stop handoff itself.
+
+10. Bear improvement - PID persistence after start
+
+Reference:
+Saves worker PID in Redis.
+
+Bear Street:
+Saves worker PID in Redis and also saves PID locally:
+
+cls._save_worker_pid(session_id, process.pid)
+cls._save_worker_pid_file(session_id, process.pid)
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:844
+
+Today's issue relevance:
+HELPFUL AFTER START, but it does not replace the missing pre-start reconciliation.
+
+Final conclusion for today's issue
+
+Most important SessionManager differences to investigate/fix are:
+
+1. Bear Street missing pre-start _reconcile_session_registry(session_id).
+2. Bear Street missing Redis PID alive check before spawning a new worker.
+3. Bear Street immediately rejects local _workers hit without checking whether the worker is stale/dead.
+
+These are the differences most likely to affect the simulation-to-live switch if today's issue involved:
+
+- "already running"
+- stale worker still visible
+- live worker not starting after simulation stop
+- duplicate worker uncertainty
+- API server restart or multi-worker process mismatch
+
+The simulation_logs difference is important, but for /api/trading/start-simulation it should be okay because Bear Street explicitly forces simulation_logs=True.
+
+
+SessionManager.stop_simulation_session() differences between Bear Street and reference
+
+Compared files:
+- Bear Street: C:\Users\Hp\Desktop\mintzy-bear-street\session_manager.py
+- Reference: C:\Users\Hp\Desktop\mintzy-plugin-updated\session_manager.py
+
+Today's issue context:
+This section focuses on whether stop_simulation_session() or the cleanup function it calls could cause the 1 PM simulation-to-live handoff issue.
+
+1. stop_simulation_session() body
+
+Reference location:
+mintzy-plugin-updated/session_manager.py:896
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:951
+
+Both repos do the same core steps:
+
+1. Set Redis simulation-stop flag using _mark_simulation_stop(session_id).
+2. Call stop_session(session_id).
+3. Call _cleanup_worker(session_id).
+4. If stopped=True, call ensure_worker_stopped(session_id, timeout=90).
+5. Return False if the worker did not fully stop.
+6. Return stopped.
+
+Conclusion:
+stop_simulation_session() itself is not behind the reference.
+
+Today's issue relevance:
+NOT A LIKELY DIRECT CAUSE.
+
+2. IMPORTANT / POSSIBLE CAUSE - ensure_worker_stopped() behavior differs
+
+stop_simulation_session() depends on ensure_worker_stopped(), and this is where the important difference exists.
+
+Reference ensure_worker_stopped() location:
+mintzy-plugin-updated/session_manager.py:584
+
+Bear Street ensure_worker_stopped() location:
+mintzy-bear-street/session_manager.py:467
+
+Reference starts by reconciling session registry:
+
+cls._reconcile_session_registry(session_id)
+
+Reference location:
+mintzy-plugin-updated/session_manager.py:586
+
+Bear Street does not call _reconcile_session_registry(session_id) at the start of ensure_worker_stopped().
+
+Why this is important:
+The reference cleans stale local/Redis worker state before deciding whether the worker is stopped.
+Bear Street can operate on local worker/PID state without first reconciling it against Redis and process liveness.
+
+Today's issue relevance:
+IMPORTANT / POSSIBLE CAUSE.
+If the 1 PM switch failed because the old simulation worker was not fully cleaned up, this difference matters.
+
+3. IMPORTANT / POSSIBLE CAUSE - Redis PID handling differs
+
+Reference uses Redis PID directly:
+
+redis_pid = cls._get_redis_pid(session_id)
+
+Reference location:
+mintzy-plugin-updated/session_manager.py:601
+
+Bear Street uses:
+
+pid = cls._resolve_worker_pid(session_id)
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:482
+
+Why this is important:
+The reference explicitly checks the shared Redis PID during cleanup.
+Bear Street resolves PID through its own helper, which may involve local PID storage and can behave differently if Redis PID and local PID file disagree.
+
+Today's issue relevance:
+IMPORTANT / POSSIBLE CAUSE.
+In multi-worker or restarted API-server flows, Redis is the shared source that tells whether another process still owns the session.
+Any mismatch here can affect whether simulation is considered fully stopped before live trading starts.
+
+4. IMPORTANT / POSSIBLE CAUSE - final stopped verification differs
+
+Reference reconciles again after attempting to stop/kill the worker:
+
+cls._reconcile_session_registry(session_id)
+redis_pid = cls._get_redis_pid(session_id)
+
+Reference location:
+mintzy-plugin-updated/session_manager.py:621
+
+Bear Street clears Redis/local PID/local worker state itself, then resolves PID again:
+
+cls._clear_worker_pid(session_id)
+cls._clear_worker_pid_file(session_id)
+cls._workers.pop(session_id, None)
+pid = cls._resolve_worker_pid(session_id)
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:493
+
+Why this is important:
+The reference validates final stopped state after reconciliation.
+Bear Street validates final stopped state after clearing its own records.
+If Bear clears tracking too early while the worker is still alive, it could report the session as clear incorrectly.
+
+Today's issue relevance:
+IMPORTANT / POSSIBLE CAUSE.
+This can matter when live start is triggered immediately after simulation stop.
+
+5. Practical conclusion for today's issue
+
+stop_simulation_session() itself matches the reference, but the cleanup function it relies on is different.
+
+Most important possible causes:
+
+1. Bear Street ensure_worker_stopped() does not start with _reconcile_session_registry(session_id).
+2. Bear Street does not use the same direct Redis PID cleanup pattern as the reference.
+3. Bear Street clears local/Redis/PID state before final verification, which may hide a still-running process if PID resolution misses it.
+
+If today's issue involved any of these symptoms, this should be treated as an important cause candidate:
+
+- simulation stopped response was delayed or failed
+- "worker did not exit in time"
+- live start failed after simulation stop
+- "already running"
+- stale PID or stale worker state
+- duplicate worker uncertainty
+- API server restart or multiple API workers around the 1 PM switch
+
+
+api_server.py stop_trading() differences between Bear Street and reference
+
+Compared files:
+- Bear Street: C:\Users\Hp\Desktop\mintzy-bear-street\api_server.py
+- Reference: C:\Users\Hp\Desktop\mintzy-plugin-updated\api_server.py
+
+Today's issue context:
+This section compares the normal live stop endpoint:
+
+/api/trading/stop/{session_id}
+
+Important note:
+The 1 PM simulation-to-live flow normally uses:
+
+/api/trading/stop-simulation/{session_id}
+
+not the normal stop_trading() endpoint.
+
+So stop_trading() is probably not the direct cause of today's 1 PM simulation-to-live issue.
+
+1. Function location
+
+Reference:
+mintzy-plugin-updated/api_server.py:2995
+
+Bear Street:
+mintzy-bear-street/api_server.py:3008
+
+Today's issue relevance:
+NOT A LIKELY DIRECT CAUSE.
+This is only a line-number shift.
+
+2. Session existence check difference
+
+Reference:
+The reference repo does not pre-check MongoDB before stopping.
+It calls:
+
+SessionManager.stop_session(session_id)
+
+Then it checks only local memory:
+
+if session_id not in sessions_store:
+    raise HTTPException(status_code=404, detail="Session not found")
+
+Reference location:
+mintzy-plugin-updated/api_server.py:3000
+
+Bear Street:
+Bear Street checks local memory first:
+
+session_exists = session_id in sessions_store
+
+Then, if DB is connected, it also checks Mongo:
+
+session_exists = session_exists or bool(
+    sessions_collection.find_one({"session_id": session_id}, {"_id": 1})
+)
+
+Bear Street location:
+mintzy-bear-street/api_server.py:3013
+
+Today's issue relevance:
+NOT A LIKELY DIRECT CAUSE for 1 PM handoff.
+But Bear Street is more defensive here because it can recognize DB-backed sessions even when RAM lost them.
+
+3. Worker stop result difference
+
+Reference:
+Calls stop_session but ignores the return value:
+
+SessionManager.stop_session(session_id)
+
+Reference location:
+mintzy-plugin-updated/api_server.py:3000
+
+Bear Street:
+Stores the stop result:
+
+worker_stopped = SessionManager.stop_session(session_id)
+
+Bear Street location:
+mintzy-bear-street/api_server.py:3022
+
+Today's issue relevance:
+NOT A LIKELY DIRECT CAUSE.
+Bear Street gives better response/debug visibility because it returns worker_stopped.
+
+4. Missing RAM session behavior difference
+
+Reference:
+If the session is not present in sessions_store after stop_session(), it raises 404:
+
+if session_id not in sessions_store:
+    raise HTTPException(status_code=404, detail="Session not found")
+
+Reference location:
+mintzy-plugin-updated/api_server.py:3002
+
+Bear Street:
+If the session is missing from sessions_store, it creates a minimal session entry:
+
+if session_id not in sessions_store:
+    sessions_store[session_id] = {"session_id": session_id}
+
+Bear Street location:
+mintzy-bear-street/api_server.py:3024
+
+Today's issue relevance:
+NOT A LIKELY DIRECT CAUSE.
+This is a Bear improvement for restored/DB-backed sessions.
+
+5. Status update difference
+
+Both repos set:
+
+sessions_store[session_id]["status"] = "stopped"
+
+Reference location:
+mintzy-plugin-updated/api_server.py:3005
+
+Bear Street location:
+mintzy-bear-street/api_server.py:3026
+
+Both repos also mark trading_status as stopped if present:
+
+trading_status[session_id]["status"] = "stopped"
+
+Reference location:
+mintzy-plugin-updated/api_server.py:3007
+
+Bear Street location:
+mintzy-bear-street/api_server.py:3028
+
+Today's issue relevance:
+NOT A LIKELY DIRECT CAUSE.
+This behavior is effectively the same.
+
+6. Persistence method difference
+
+Reference:
+Uses full session persistence:
+
+await persist_session_state(session_id)
+
+Reference location:
+mintzy-plugin-updated/api_server.py:3012
+
+Bear Street:
+Uses targeted stop metadata persistence:
+
+persist_session_metadata_sync(session_id, {
+    "status": "stopped",
+    "trading_status": "stopped",
+    "stopped_at": datetime.utcnow(),
+    "worker_pid": None,
+})
+
+Bear Street location:
+mintzy-bear-street/api_server.py:3033
+
+Today's issue relevance:
+NOT A LIKELY DIRECT CAUSE.
+Bear Street is safer here because it writes only stop-related fields instead of snapshotting the full in-memory session.
+This reduces the chance of overwriting broker/session auth fields during a normal live stop.
+
+7. Response difference
+
+Reference response:
+
+{
+    "success": True,
+    "message": "Trading session stop requested",
+    "session_id": session_id
+}
+
+Reference location:
+mintzy-plugin-updated/api_server.py:3014
+
+Bear Street response:
+
+{
+    "success": True,
+    "message": "Trading session stopped",
+    "session_id": session_id,
+    "worker_stopped": worker_stopped,
+    "session_existed": session_exists,
+}
+
+Bear Street location:
+mintzy-bear-street/api_server.py:3041
+
+Today's issue relevance:
+NOT A LIKELY DIRECT CAUSE.
+Bear Street response is more informative.
+
+8. Practical conclusion for today's issue
+
+stop_trading() in api_server.py is probably not the cause of the 1 PM simulation-to-live problem because the handoff flow uses stop-simulation, not normal stop.
+
+Bear Street's stop_trading() is mostly more defensive than the reference:
+
+1. It checks MongoDB for session existence.
+2. It does not 404 just because RAM lost the session.
+3. It returns worker_stopped and session_existed.
+4. It persists only targeted stop fields.
+
+This function should be marked:
+
+NOT A LIKELY DIRECT CAUSE.
+
+Potentially helpful Bear improvement:
+Bear Street's targeted persistence reduces the risk of overwriting authenticated broker/session fields during a normal live stop.
+
+
+SessionManager.stop_session() differences between Bear Street and reference
+
+Compared files:
+- Bear Street: C:\Users\Hp\Desktop\mintzy-bear-street\session_manager.py
+- Reference: C:\Users\Hp\Desktop\mintzy-plugin-updated\session_manager.py
+
+Today's issue context:
+stop_simulation_session() calls stop_session(session_id), so stop_session() can directly affect the 1 PM simulation-to-live handoff.
+
+1. IMPORTANT / POSSIBLE CAUSE - no local worker and no PID found behavior differs
+
+Reference location:
+mintzy-plugin-updated/session_manager.py:811
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:894
+
+Reference:
+If the worker is not in local memory, reference checks Redis.
+If Redis does not have a PID, it returns False:
+
+if not pid_str:
+    return False
+
+Reference location:
+mintzy-plugin-updated/session_manager.py:824
+
+Bear Street:
+If the worker is not in local memory, Bear Street resolves PID using Redis, local PID file, and Mongo worker_pid.
+If no PID is found, it returns True:
+
+if not pid:
+    print(f"[SessionManager] No worker PID found - treating as already stopped")
+    cls._clear_worker_pid(session_id)
+    cls._clear_worker_pid_file(session_id)
+    return True
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:904
+
+Why this is important:
+Reference says "I did not stop anything" when no Redis PID exists.
+Bear Street says "already stopped, success" when no PID can be resolved.
+
+Today's issue relevance:
+IMPORTANT / POSSIBLE CAUSE.
+During stop-simulation, this can hide a worker tracking problem.
+If Bear Street lost Redis/PID tracking but the simulation worker was still alive, stop_session() could return success without actually stopping the worker.
+
+Symptoms this could explain:
+- stop-simulation returned success even though the old simulation worker was not fully stopped
+- live start happened immediately after a false stop success
+- live start later saw "already running"
+- duplicate/stale worker behavior
+- old simulation worker kept running after 1 PM
+
+2. PID lookup source difference
+
+Reference:
+Checks Redis PID only:
+
+pid_str = cls._redis().get(f"{cls.REDIS_KEY_PREFIX}{session_id}")
+
+Reference location:
+mintzy-plugin-updated/session_manager.py:822
+
+Bear Street:
+Uses _resolve_worker_pid(session_id), which checks:
+
+1. Redis
+2. local PID file
+3. Mongo worker_pid
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:902
+
+Helper location:
+mintzy-bear-street/session_manager.py:668
+
+Today's issue relevance:
+IMPORTANT / POSSIBLE CAUSE.
+This is stronger if the extra PID sources are correct.
+But if Redis, PID file, and Mongo disagree, behavior can differ from the reference and make debugging harder.
+
+3. PID termination difference
+
+Reference:
+Uses inline SIGTERM/SIGKILL logic and has a fallback when psutil is not installed.
+
+Reference location:
+mintzy-plugin-updated/session_manager.py:831
+
+Bear Street:
+Uses helper:
+
+stopped = cls._terminate_pid(pid)
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:911
+
+Helper location:
+mintzy-bear-street/session_manager.py:700
+
+Today's issue relevance:
+POSSIBLE CAUSE ONLY IF psutil is missing or PID termination fails.
+Bear Street imports psutil inside _terminate_pid(). If psutil is unavailable, termination can return False through the generic exception path.
+
+4. Cleanup after successful PID lookup
+
+Reference:
+Deletes Redis PID after stopping.
+
+Bear Street:
+Deletes Redis PID and also clears:
+
+- Mongo worker_pid
+- local PID file
+
+Bear Street locations:
+mintzy-bear-street/session_manager.py:913
+mintzy-bear-street/session_manager.py:920
+mintzy-bear-street/session_manager.py:921
+
+Today's issue relevance:
+HELPFUL WHEN PID WAS FOUND.
+Bear Street has more complete cleanup once it finds a PID.
+
+5. Local worker shutdown path
+
+Both repos:
+
+1. set worker.stop_event
+2. join for 60 seconds
+3. terminate if still alive
+4. kill if still alive after terminate
+5. delete Redis PID
+6. remove local worker entry
+
+Reference location:
+mintzy-plugin-updated/session_manager.py:875
+
+Bear Street location:
+mintzy-bear-street/session_manager.py:927
+
+Today's issue relevance:
+NOT A DIFFERENCE.
+The core local-worker stop behavior is effectively the same.
+
+6. Practical conclusion for today's issue
+
+stop_session() should be marked:
+
+IMPORTANT / POSSIBLE CAUSE.
+
+The most important behavior difference is:
+
+Reference:
+no local worker + no Redis PID = False
+
+Bear Street:
+no local worker + no resolved PID = True
+
+For a normal stop request, treating "no PID found" as already stopped can be acceptable.
+For the 1 PM simulation-to-live handoff, it can hide a serious worker tracking issue because stop_simulation_session() may believe simulation stopped successfully even if it did not actually stop any worker.
+
+
+Gateway autoStopDueSimulations() daily latch comparison
+======================================================
+
+Files compared:
+- mintzy-api-gateway/modules/bear_street/services/plugin.simulation.service.js
+- mintzy-api-gateway/modules/angle_one/services/plugin.simulation.service.js
+
+Function compared:
+autoStopDueSimulations()
+
+Status:
+SUGGESTED IMPROVEMENT ONLY.
+Do not treat this as a Bear Street bug right now because the same behavior exists in the working angle_one reference module.
+
+Reference behavior:
+Angle One sets lastAutoStopDateKey = today before looping through all due simulation sessions.
+
+Bear Street behavior:
+Bear Street also sets lastAutoStopDateKey = today before looping through all due simulation sessions.
+
+Difference:
+No meaningful logic difference.
+Bear uses broker: BROKER_KEY, where BROKER_KEY = "bear_street".
+Angle One uses broker: "angle_one".
+
+Risk:
+If one session fails during the 1 PM auto-stop/live-handoff loop, the in-memory daily latch can prevent another automatic retry for the same trade date.
+
+Reason not fixing now:
+This appears intentional/reference-aligned because it prevents repeated auto-stop calls from hitting the plugin VM again and again after 1 PM.
+Since angle_one has the same latch behavior and is being treated as the correct reference logic, Bear Street should keep this behavior for now.
+
+Possible future improvement:
+If needed later, gateway can track retry state per session instead of one global daily latch.
+That would allow failed sessions to retry without repeatedly touching sessions that already completed successfully.

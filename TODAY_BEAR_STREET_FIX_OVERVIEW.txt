@@ -1,0 +1,169 @@
+Bear Street - Today Fix / Debug Overview
+Date: 2026-09-03
+
+Main problem we debugged:
+- Bear Street simulation cycle 2 appeared to get stuck after order execution / LTP fetch.
+- API gateway tried stop-simulation around 13:00 IST, but Bear Street VM did not complete the stop request cleanly.
+- live_pnl_snapshots was empty because /api/trading/live-pnl was likely returning success=true but ready=false.
+- Root suspicion: Bear Street LTP/poller/on_ltp_tick/Redis live_pnl pipeline was not producing live_pnl:{session_id}.
+
+Files touched today:
+- auto_trader_exposure_expansion.py
+- api_server.py
+- bear_street_ltp_poller.py
+
+1. Live PnL tick debug logs
+File: auto_trader_exposure_expansion.py
+Area: on_ltp_tick()
+
+Added throttled logs with marker:
+[LIVE-PNL-TICK]
+
+What these logs show:
+- Tick received for symbol or not.
+- Session id.
+- LTP value.
+- Whether self.positions has that symbol.
+- Current self.positions keys.
+- Current _paper_positions keys.
+- Skip reason if no position exists.
+- Skip reason if qty <= 0 or entry_price <= 0.
+- Updated live PnL value when live_pnl dict is updated.
+
+Why:
+- Tomorrow we need to know if BearStreetLTPPoller is actually calling trader.on_ltp_tick().
+- If tick arrives but live_pnl is still empty, logs will show whether position was missing or invalid.
+
+2. Redis live_pnl publish debug logs
+File: auto_trader_exposure_expansion.py
+Area: _push_live_pnl_to_redis()
+
+Added throttled logs with marker:
+[LIVE-PNL-REDIS]
+
+What these logs show:
+- Redis/session missing context.
+- live_snapshot empty even though positions may exist.
+- Which symbols are written to Redis.
+- realized_pnl, live_unrealized_pnl, total_pnl.
+- Redis key being written: live_pnl:{session_id}
+- TTL currently remains 5 seconds.
+
+Why:
+- Gateway saves live_pnl_snapshots only when endpoint returns ready=true with data.
+- This tells us whether Bear Street ever writes live_pnl:{session_id} into Redis.
+
+3. /live-pnl endpoint debug logs
+File: api_server.py
+Area: GET /api/trading/live-pnl/{session_id}
+
+Added throttled logs with marker:
+[LIVE-PNL-ENDPOINT]
+
+What these logs show:
+- Redis unavailable.
+- Redis read error.
+- raw_missing, meaning Redis key live_pnl:{session_id} does not exist and endpoint returns ready=false.
+- Malformed Redis payload.
+- ready=true response with symbol list and PnL totals.
+
+Why:
+- Earlier gateway logs only showed HTTP 200.
+- HTTP 200 alone is not enough because Bear Street can return ready=false.
+- Tomorrow this will prove exactly what the endpoint returned.
+
+4. Bear Street poller debug logs
+File: bear_street_ltp_poller.py
+Area: BearStreetLTPPoller._poll_loop()
+
+Added throttled logs with marker:
+[LTP-BS]
+
+What these logs show:
+- get_positions() success/error.
+- Number of position rows returned by Bear Street broker.
+- Which symbols are being watched.
+- Which symbols had LTP in price_map.
+- Missing LTP for each watched symbol.
+- Tick emitted to on_ltp_tick(), including changed=True/False.
+
+Why:
+- Bear Street does not use Angle One websocket stream.
+- Bear Street poller depends on broker.get_positions() having ltp/net_price/last_price.
+- In paper simulation, broker positions may be empty even when internal paper positions exist.
+- This will tell us whether the problem is before on_ltp_tick().
+
+5. Existing current-code fixes/logic confirmed during review
+File: auto_trader_exposure_expansion.py
+
+Confirmed current code has:
+- Immediate paper fills return filled=True from executor.
+- Immediate filled orders release reserved exposure via _release_exposure().
+- Paper flip logic closes old side, books realized PnL, then opens new side using qty // 2.
+- Filled paper orders are removed from cycle_orders_sent, so they should not remain as PENDING in same-cycle UI rows.
+- symbol_pnl rows combine symbol_realized_pnl + symbol_unrealized_pnl.
+
+Why:
+- This addresses the earlier issue where INFY/MARUTI flip orders looked pending and PnL appeared 0.
+- It also reduces stale reserved_exposure causing bad portfolio cap values.
+
+6. Exited symbols / RMS exit logic present
+File: auto_trader_exposure_expansion.py
+Area: RMS ticker exit / exit_single_position / _persist_symbol_exit()
+
+Confirmed current code has:
+- Per-ticker RMS triggers inside on_ltp_tick().
+- RMS exit worker calls exit_single_position(..., exit_reason="RMS_TICKER_EXIT").
+- Exit is persisted into Mongo collection exited_symbols.
+- Trading log exit row is also upserted.
+
+Important:
+- RMS exit depends on live ticks.
+- If [LIVE-PNL-TICK] never appears, RMS ticker exit will also not trigger.
+
+Tomorrow log markers to search:
+- [LTP-BS]
+- [LIVE-PNL-TICK]
+- [LIVE-PNL-REDIS]
+- [LIVE-PNL-ENDPOINT]
+- [RMS-TICKER]
+- [EXITED-SYMBOLS]
+
+Expected healthy flow tomorrow:
+1. [LTP-BS] positions success rows=...
+2. [LTP-BS] emit_tick symbol=...
+3. [LIVE-PNL-TICK] received ... has_position=True
+4. [LIVE-PNL-TICK] updated ... unrealized=...
+5. [LIVE-PNL-REDIS] setex key=live_pnl:{session_id}
+6. [LIVE-PNL-ENDPOINT] ready=true symbols=[...]
+7. API gateway should then save live_pnl_snapshots.
+
+If logs show this:
+- [LTP-BS] positions success rows=0
+  Then Bear Street broker position book has no rows, so poller cannot produce ticks from positions.
+
+- [LTP-BS] missing_ltp symbol=...
+  Then position rows exist but do not have ltp/net_price/last_price.
+
+- [LIVE-PNL-TICK] skip_no_position
+  Then poller tick arrived, but trader self.positions does not have that symbol.
+
+- [LIVE-PNL-TICK] skip_invalid_position
+  Then position exists but qty or entry_price is invalid.
+
+- [LIVE-PNL-REDIS] live_snapshot_empty
+  Then Redis publish ran but live_pnl dict has no symbol data.
+
+- [LIVE-PNL-ENDPOINT] ready=false raw_missing
+  Then endpoint was hit, but Redis key live_pnl:{session_id} was absent/expired.
+
+Remaining risk not fixed by today's logging:
+- The post-order LTP fetch threadpool still has no hard timeout.
+- If market_client.fetch_price hangs, cycle can still block.
+- Redis live_pnl TTL is still 5 seconds.
+- Bear Street poller still depends on broker.get_positions() LTP fields, not a true quote websocket like Angle One.
+
+Verification done:
+- git diff --check passed for the important touched files.
+- Python compile check could not be run on this machine because python/py is not installed in PATH.
+

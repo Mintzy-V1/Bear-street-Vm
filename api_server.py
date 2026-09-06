@@ -143,12 +143,28 @@ MONGO_CONFIG_DB_NAME = os.environ.get("MONGO_CONFIG_DB_NAME") or "test"
 DB_CONNECTED = False
 sessions_collection = None
 logs_collection = None
+pyramid_pnls_collection = None
+exited_symbols_collection = None
 try:
     mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
     mongo_db = mongo_client[MONGO_DB_NAME]
     sessions_collection = mongo_db["plugin_sessions"]
     logs_collection = mongo_db["plugin_logs"]
     trading_logs_collection = mongo_db["trading_logs"]
+    pyramid_pnls_collection = mongo_client[MONGO_CONFIG_DB_NAME]["pyramid_pnls"]
+    exited_symbols_collection = mongo_client[MONGO_CONFIG_DB_NAME]["exited_symbols"]
+    try:
+        exited_symbols_collection.create_index(
+            [("session_id", 1), ("symbol", 1)],
+            unique=True,
+            name="uniq_session_symbol_exit",
+        )
+        exited_symbols_collection.create_index(
+            [("session_id", 1), ("status", 1)],
+            name="idx_session_exit_status",
+        )
+    except Exception as index_exc:
+        logger.warning("exited_symbols index ensure failed (%s)", index_exc)
 
     # Force server selection to verify connectivity
     mongo_client.admin.command('ping')
@@ -162,6 +178,8 @@ try:
         )
 except Exception as exc:
     logger.warning("MongoDB persistence unavailable (%s)", exc)
+    pyramid_pnls_collection = None
+    exited_symbols_collection = None
 
 def _limit_rows(rows: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
     if not isinstance(limit, int) or limit <= 0:
@@ -789,45 +807,79 @@ def get_trading_snapshot(session_id: str ,x_plugin_api_key: str = Header(None)):
         "data": snap
     }
 
-
 # ---- Redis (used to receive per-ticker RMS exit signals from the worker process) ----
 import os as _os
 _rms_redis = None
 try:
     import redis as _redis
-    if _os.environ.get("REDIS_CLUSTER", "").lower() in ("1", "true", "yes"):
-        _rms_redis = _redis.RedisCluster(
-            host=_os.environ.get("REDIS_HOST", "10.45.41.115"),
-            port=int(_os.environ.get("REDIS_PORT", "6379")),
-            ssl=True,
-            ssl_cert_reqs=None,
-            decode_responses=True,
-            socket_connect_timeout=5,
-        )
-    else:
-        _rms_redis = _redis.Redis(
-            host=_os.environ.get("REDIS_HOST", "127.0.0.1"),
-            port=int(_os.environ.get("REDIS_PORT", "6379")),
-            decode_responses=True,
-            socket_connect_timeout=5,
-        )
+    _redis_host_raw = _os.environ.get(
+        "REDIS_HOST",
+        "clustercfg.mintzy-redis.ci2qc0.use1.cache.amazonaws.com",
+    )
+    _redis_host = _redis_host_raw
+    _redis_port = int(_os.environ.get("REDIS_PORT", "6379"))
+    if ":" in _redis_host_raw:
+        _redis_host, _redis_port_raw = _redis_host_raw.rsplit(":", 1)
+        if _redis_port_raw:
+            _redis_port = int(_redis_port_raw)
+
+    _rms_redis = _redis.RedisCluster(
+        host=_redis_host,
+        port=_redis_port,
+        ssl=True,
+        ssl_cert_reqs=None,
+        decode_responses=True,
+        socket_connect_timeout=5,
+    )
     _rms_redis.ping()
 except Exception as _e:
     print(f"[API SERVER] RMS redis client unavailable: {_e}")
     _rms_redis = None
 
+_live_pnl_endpoint_last_log = {}
+
+
+def _log_live_pnl_endpoint(session_id: str, state: str, message: str, interval: float = 10.0) -> None:
+    try:
+        now = time.time()
+        key = f"{session_id}:{state}"
+        last = float(_live_pnl_endpoint_last_log.get(key, 0.0) or 0.0)
+        if interval <= 0 or now - last >= interval:
+            _live_pnl_endpoint_last_log[key] = now
+            print(message, flush=True)
+    except Exception:
+        pass
+
 
 @app.get("/api/trading/live-pnl/{session_id}")
 def get_live_pnl(session_id: str, x_plugin_api_key: str = Header(None)):
     if not _rms_redis:
+        _log_live_pnl_endpoint(
+            session_id,
+            "redis-unavailable",
+            f"[LIVE-PNL-ENDPOINT] session={session_id} ready=false error=redis_unavailable",
+            interval=5.0,
+        )
         return {"success": False, "error": "Redis unavailable"}
 
     try:
         raw = _rms_redis.get(f"live_pnl:{session_id}")
     except Exception as e:
+        _log_live_pnl_endpoint(
+            session_id,
+            "redis-error",
+            f"[LIVE-PNL-ENDPOINT] session={session_id} ready=false error=redis_error detail={e}",
+            interval=5.0,
+        )
         return {"success": False, "error": f"Redis error: {e}"}
 
     if not raw:
+        _log_live_pnl_endpoint(
+            session_id,
+            "not-ready",
+            f"[LIVE-PNL-ENDPOINT] session={session_id} ready=false raw_missing key=live_pnl:{session_id}",
+            interval=5.0,
+        )
         return {
             "success": True,
             "ready": False,
@@ -836,9 +888,27 @@ def get_live_pnl(session_id: str, x_plugin_api_key: str = Header(None)):
 
     try:
         data = json.loads(raw)
-    except Exception:
+    except Exception as e:
+        _log_live_pnl_endpoint(
+            session_id,
+            "malformed",
+            f"[LIVE-PNL-ENDPOINT] session={session_id} ready=false error=malformed_payload detail={e}",
+            interval=5.0,
+        )
         return {"success": False, "error": "Malformed payload in Redis"}
 
+    symbols = data.get("symbols") or {}
+    _log_live_pnl_endpoint(
+        session_id,
+        "ready",
+        (
+            f"[LIVE-PNL-ENDPOINT] session={session_id} ready=true "
+            f"symbols={list(symbols.keys())} realized={data.get('realized_pnl')} "
+            f"live_unrealized={data.get('live_unrealized_pnl')} total={data.get('total_pnl')} "
+            f"raw_len={len(raw)}"
+        ),
+        interval=5.0,
+    )
     return {"success": True, "ready": True, "data": data}
 
 
@@ -2593,7 +2663,51 @@ async def get_trading_status(session_id: str):
         "logs": (logs or [])[-100:]
     }
 
-#exit statusendpoint 
+@app.get("/api/trading/pyramid-pnl/{session_id}")
+async def get_pyramid_pnl(session_id: str, x_plugin_api_key: str = Header(None)):
+    if not DB_CONNECTED or pyramid_pnls_collection is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    doc = await run_in_threadpool(
+        pyramid_pnls_collection.find_one,
+        {"session_id": session_id},
+        {"_id": 0},
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Pyramid PnL snapshot not found")
+    return {"success": True, **doc}
+
+
+@app.get("/api/trading/exited-symbols/{session_id}")
+async def get_exited_symbols(session_id: str, x_plugin_api_key: str = Header(None)):
+    if not DB_CONNECTED or exited_symbols_collection is None:
+        logger.warning("[EXITED-SYMBOLS-API] database unavailable session_id=%s", session_id)
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    logger.info("[EXITED-SYMBOLS-API] fetch start session_id=%s", session_id)
+    cursor = exited_symbols_collection.find(
+        {"session_id": session_id},
+        {"_id": 0},
+    ).sort([
+        ("exit_time_utc", 1),
+        ("updated_at", 1),
+        ("symbol", 1),
+    ])
+    symbols = await run_in_threadpool(list, cursor)
+    logger.info(
+        "[EXITED-SYMBOLS-API] fetch done session_id=%s count=%s symbols=%s",
+        session_id,
+        len(symbols),
+        [row.get("symbol") for row in symbols],
+    )
+    return {
+        "success": True,
+        "session_id": session_id,
+        "count": len(symbols),
+        "symbols": symbols,
+    }
+
+
+#exit statusendpoint
 @app.get("/api/trading/exit-status/{session_id}")
 async def get_exit_status(session_id: str, x_plugin_api_key: str = Header(None)):
    
@@ -2754,24 +2868,7 @@ def get_final_tradebook(
         media_type="text/csv",
     )
 
-
-@app.post("/api/trading/stop-simulation/{session_id}")
-async def stop_trading_simulation(session_id: str, x_plugin_api_key: str = Header(None)):
-    """
-    Stop the paper simulation worker.
-    If pyramid finds profitable symbols: keeps session authenticated for live handoff.
-    If no profitable symbols: marks session stopped (new session required for live).
-    """
-    endpoint_started_perf = time.perf_counter()
-    endpoint_started_ms = _sim_plugin_now_ms()
-    _sim_plugin_log(
-        "POST /api/trading/stop-simulation ENTER",
-        session_id=session_id,
-        started_at_ms=endpoint_started_ms,
-        body="(none — session_id is path param only)",
-    )
-
-    lookup_started_perf = time.perf_counter()
+async def _lookup_stop_simulation_session(session_id: str):
     session_exists = (
         session_id in sessions_store
         or session_id in trading_status
@@ -2781,8 +2878,163 @@ async def stop_trading_simulation(session_id: str, x_plugin_api_key: str = Heade
     if not session_exists and DB_CONNECTED:
         db_record = await fetch_session_from_db(session_id)
         session_exists = db_record is not None
-    elif DB_CONNECTED:
-        db_record = await fetch_session_from_db(session_id)
+    return session_exists, db_record
+
+
+async def _finalize_stop_simulation_response(
+    session_id: str,
+    pyramid_handoff: Dict[str, Any],
+    db_record: Optional[Dict[str, Any]],
+    endpoint_started_perf: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Apply session store / Mongo updates after simulation worker stop + pyramid.
+    Returns the same payload shape as the legacy synchronous stop-simulation endpoint.
+    """
+    live_allowed = bool(pyramid_handoff.get("live_allowed", False))
+    post_restore_configuration_id = (
+        sessions_store.get(session_id, {}).get("configuration_id")
+        or (db_record or {}).get("configuration_id")
+    )
+
+    restore_started_perf = time.perf_counter()
+    restored = await get_or_restore_session(session_id)
+
+    timing_ms = (
+        _sim_plugin_elapsed_ms(endpoint_started_perf)
+        if endpoint_started_perf is not None
+        else None
+    )
+
+    if not live_allowed:
+        if session_id in sessions_store:
+            sessions_store[session_id]["status"] = "stopped"
+        elif restored:
+            sessions_store[session_id] = {**restored, "status": "stopped"}
+        elif session_id not in sessions_store:
+            sessions_store[session_id] = {
+                "session_id": session_id,
+                "status": "stopped",
+                "configuration_id": post_restore_configuration_id,
+            }
+
+        if session_id in trading_status:
+            trading_status[session_id]["status"] = "stopped"
+        else:
+            trading_status[session_id] = {"status": "stopped"}
+
+        if post_restore_configuration_id and session_id in sessions_store:
+            sessions_store[session_id]["configuration_id"] = post_restore_configuration_id
+
+        try:
+            persist_payload = {
+                "status": "stopped",
+                "trading_status": "stopped",
+                "stopped_reason": pyramid_handoff.get("reason") or "no_profitable_symbols",
+            }
+            if post_restore_configuration_id:
+                persist_payload["configuration_id"] = post_restore_configuration_id
+            persist_session_metadata_sync(session_id, persist_payload)
+        except Exception as persist_err:
+            _sim_plugin_log(
+                "stop-simulation persist warning",
+                session_id=session_id,
+                error=str(persist_err),
+            )
+
+        SessionManager.clear_pyramid_handoff_result(session_id)
+        add_log(
+            session_id,
+            "Paper simulation stopped — no profitable symbols; session marked stopped",
+        )
+
+        response_payload = {
+            "success": True,
+            "ready": True,
+            "live_allowed": False,
+            "pyramid": pyramid_handoff,
+            "message": (
+                "Simulation stopped. No profitable symbols — session closed. "
+                "Create a new session for live trading."
+            ),
+            "session_id": session_id,
+            "status": "stopped",
+            "trading_status": "stopped",
+            "configuration_id": post_restore_configuration_id,
+        }
+        if timing_ms is not None:
+            response_payload["timing_ms"] = timing_ms
+        return response_payload
+
+    if session_id in trading_status:
+        trading_status[session_id]["status"] = "simulation_stopped"
+
+    if session_id in sessions_store:
+        sessions_store[session_id]["status"] = "authenticated"
+    elif restored:
+        sessions_store[session_id] = {**restored, "status": "authenticated"}
+
+    if post_restore_configuration_id and session_id in sessions_store:
+        sessions_store[session_id]["configuration_id"] = post_restore_configuration_id
+
+    try:
+        persist_payload = {
+            "status": "authenticated",
+            "trading_status": "simulation_stopped",
+        }
+        if post_restore_configuration_id:
+            persist_payload["configuration_id"] = post_restore_configuration_id
+        persist_session_metadata_sync(session_id, persist_payload)
+    except Exception as persist_err:
+        _sim_plugin_log(
+            "stop-simulation persist warning",
+            session_id=session_id,
+            error=str(persist_err),
+        )
+
+    SessionManager.clear_pyramid_handoff_result(session_id)
+    add_log(session_id, "Paper simulation stopped (session remains authenticated)")
+
+    response_payload = {
+        "success": True,
+        "ready": True,
+        "live_allowed": live_allowed,
+        "pyramid": pyramid_handoff,
+        "message": "Simulation stopped; session remains authenticated",
+        "session_id": session_id,
+        "status": "authenticated",
+        "trading_status": "simulation_stopped",
+        "configuration_id": post_restore_configuration_id,
+    }
+    if timing_ms is not None:
+        response_payload["timing_ms"] = timing_ms
+    _ = restore_started_perf
+    return response_payload
+
+
+@app.post("/api/trading/stop-simulation/{session_id}")
+async def stop_trading_simulation(
+    session_id: str,
+    wait: bool = Query(False, description="Block until worker stop completes (legacy sync mode)"),
+    x_plugin_api_key: str = Header(None),
+):
+    """
+    Stop the paper simulation worker.
+    Default: async accept (202) — poll GET .../status for completion + pyramid handoff.
+    ?wait=true: legacy blocking behaviour (may exceed gunicorn worker timeout).
+    """
+    endpoint_started_perf = time.perf_counter()
+    endpoint_started_ms = _sim_plugin_now_ms()
+    _sim_plugin_log(
+        "POST /api/trading/stop-simulation ENTER",
+        session_id=session_id,
+        started_at_ms=endpoint_started_ms,
+        wait=wait,
+        body="(none — session_id is path param only)",
+    )
+
+    lookup_started_perf = time.perf_counter()
+    session_exists, db_record = await _lookup_stop_simulation_session(session_id)
 
     _sim_plugin_log(
         "stop-simulation phase=session_lookup",
@@ -2807,9 +3059,38 @@ async def stop_trading_simulation(session_id: str, x_plugin_api_key: str = Heade
         raise HTTPException(status_code=404, detail="Session not found")
 
     stop_worker_started_perf = time.perf_counter()
-    stopped = SessionManager.stop_simulation_session(session_id)
+
+    if wait:
+        stopped = await run_in_threadpool(SessionManager.stop_simulation_session, session_id)
+        _sim_plugin_log(
+            "stop-simulation phase=SessionManager.stop_simulation_session (sync wait=true)",
+            session_id=session_id,
+            stopped=stopped,
+            elapsed_ms=_sim_plugin_elapsed_ms(stop_worker_started_perf),
+        )
+        if not stopped:
+            raise HTTPException(
+                status_code=503,
+                detail="Failed to stop paper simulation (simulation-stop flag or worker shutdown failed)",
+            )
+        pyramid_handoff = SessionManager.read_pyramid_handoff_result(session_id) or {}
+        response_payload = await _finalize_stop_simulation_response(
+            session_id,
+            pyramid_handoff,
+            db_record,
+            endpoint_started_perf,
+        )
+        _sim_plugin_log(
+            "POST /api/trading/stop-simulation EXIT sync",
+            session_id=session_id,
+            live_allowed=response_payload.get("live_allowed"),
+            total_elapsed_ms=_sim_plugin_elapsed_ms(endpoint_started_perf),
+        )
+        return response_payload
+
+    stopped = await run_in_threadpool(SessionManager.stop_simulation_session_async, session_id)
     _sim_plugin_log(
-        "stop-simulation phase=SessionManager.stop_simulation_session",
+        "stop-simulation phase=SessionManager.stop_simulation_session_async",
         session_id=session_id,
         stopped=stopped,
         elapsed_ms=_sim_plugin_elapsed_ms(stop_worker_started_perf),
@@ -2817,175 +3098,104 @@ async def stop_trading_simulation(session_id: str, x_plugin_api_key: str = Heade
 
     if not stopped:
         _sim_plugin_log(
-            "stop-simulation ABORT worker stop failed",
+            "stop-simulation ABORT async worker signal failed",
             session_id=session_id,
             total_elapsed_ms=_sim_plugin_elapsed_ms(endpoint_started_perf),
         )
         raise HTTPException(
             status_code=503,
-            detail="Failed to stop paper simulation (simulation-stop flag or worker shutdown failed)",
+            detail="Failed to queue paper simulation stop (simulation-stop flag or worker signal failed)",
         )
 
-    pyramid_handoff = SessionManager.read_pyramid_handoff_result(session_id) or {}
-    live_allowed = bool(pyramid_handoff.get("live_allowed", True))
-    _sim_plugin_log(
-        "stop-simulation phase=pyramid_handoff",
-        session_id=session_id,
-        live_allowed=live_allowed,
-        pyramid_reason=pyramid_handoff.get("reason"),
-        profitable_count=pyramid_handoff.get("profitable_count"),
-        symbols_for_live=len(pyramid_handoff.get("symbols_for_live") or []),
-    )
-
-    post_restore_configuration_id = (
-        sessions_store.get(session_id, {}).get("configuration_id")
-        or (db_record or {}).get("configuration_id")
-    )
-
-    restore_started_perf = time.perf_counter()
-    restored = await get_or_restore_session(session_id)
-
-    if not live_allowed:
-        if session_id in sessions_store:
-            sessions_store[session_id]["status"] = "stopped"
-        elif restored:
-            sessions_store[session_id] = {**restored, "status": "stopped"}
-        elif session_id not in sessions_store:
-            sessions_store[session_id] = {
-                "session_id": session_id,
-                "status": "stopped",
-                "configuration_id": post_restore_configuration_id,
-            }
-
-        if session_id in trading_status:
-            trading_status[session_id]["status"] = "stopped"
-        else:
-            trading_status[session_id] = {"status": "stopped"}
-
-        if post_restore_configuration_id and session_id in sessions_store:
-            sessions_store[session_id]["configuration_id"] = post_restore_configuration_id
-
-        _sim_plugin_log(
-            "stop-simulation phase=mark_stopped_no_profitable_symbols",
-            session_id=session_id,
-            post_restore_status=sessions_store.get(session_id, {}).get("status"),
-            configuration_id=post_restore_configuration_id,
-            elapsed_ms=_sim_plugin_elapsed_ms(restore_started_perf),
-        )
-
-        try:
-            persist_started_perf = time.perf_counter()
-            persist_payload = {
-                "status": "stopped",
-                "trading_status": "stopped",
-                "stopped_reason": pyramid_handoff.get("reason") or "no_profitable_symbols",
-            }
-            if post_restore_configuration_id:
-                persist_payload["configuration_id"] = post_restore_configuration_id
-            persist_session_metadata_sync(session_id, persist_payload)
-            _sim_plugin_log(
-                "stop-simulation phase=persist_session_metadata_sync",
-                session_id=session_id,
-                elapsed_ms=_sim_plugin_elapsed_ms(persist_started_perf),
-            )
-        except Exception as persist_err:
-            _sim_plugin_log(
-                "stop-simulation persist warning",
-                session_id=session_id,
-                error=str(persist_err),
-            )
-
-        SessionManager.clear_pyramid_handoff_result(session_id)
-        add_log(
-            session_id,
-            "Paper simulation stopped — no profitable symbols; session marked stopped",
-        )
-
-        response_payload = {
-            "success": True,
-            "live_allowed": False,
-            "pyramid": pyramid_handoff,
-            "message": (
-                "Simulation stopped. No profitable symbols — session closed. "
-                "Create a new session for live trading."
-            ),
-            "session_id": session_id,
-            "status": "stopped",
-            "trading_status": "stopped",
-            "configuration_id": post_restore_configuration_id,
-            "timing_ms": _sim_plugin_elapsed_ms(endpoint_started_perf),
-        }
-        _sim_plugin_log(
-            "POST /api/trading/stop-simulation EXIT stopped_no_live",
-            session_id=session_id,
-            configuration_id=post_restore_configuration_id,
-            total_elapsed_ms=_sim_plugin_elapsed_ms(endpoint_started_perf),
-        )
-        return response_payload
-
-    if session_id in trading_status:
-        trading_status[session_id]["status"] = "simulation_stopped"
-
-    if session_id in sessions_store:
-        sessions_store[session_id]["status"] = "authenticated"
-    elif restored:
-        sessions_store[session_id] = {**restored, "status": "authenticated"}
-
-    post_restore_status = sessions_store.get(session_id, {}).get("status")
-    if post_restore_configuration_id and session_id in sessions_store:
-        sessions_store[session_id]["configuration_id"] = post_restore_configuration_id
-
-    _sim_plugin_log(
-        "stop-simulation phase=restore_authenticated",
-        session_id=session_id,
-        post_restore_status=post_restore_status,
-        configuration_id=post_restore_configuration_id,
-        has_broker_session=bool(sessions_store.get(session_id, {}).get("broker_session")),
-        elapsed_ms=_sim_plugin_elapsed_ms(restore_started_perf),
-    )
-
-    try:
-        persist_started_perf = time.perf_counter()
-        persist_payload = {
-            "status": "authenticated",
-            "trading_status": "simulation_stopped",
-        }
-        if post_restore_configuration_id:
-            persist_payload["configuration_id"] = post_restore_configuration_id
-        persist_session_metadata_sync(session_id, persist_payload)
-        _sim_plugin_log(
-            "stop-simulation phase=persist_session_metadata_sync",
-            session_id=session_id,
-            elapsed_ms=_sim_plugin_elapsed_ms(persist_started_perf),
-        )
-    except Exception as persist_err:
-        _sim_plugin_log(
-            "stop-simulation persist warning",
-            session_id=session_id,
-            error=str(persist_err),
-        )
-
-    SessionManager.clear_pyramid_handoff_result(session_id)
-    add_log(session_id, "Paper simulation stopped (session remains authenticated)")
-
-    response_payload = {
+    accepted_payload = {
         "success": True,
-        "live_allowed": True,
-        "pyramid": pyramid_handoff,
-        "message": "Simulation stopped; session remains authenticated",
+        "accepted": True,
+        "ready": False,
+        "status": "stopping",
         "session_id": session_id,
-        "status": "authenticated",
-        "trading_status": "simulation_stopped",
-        "configuration_id": post_restore_configuration_id,
+        "message": "Simulation stop accepted; poll status endpoint for pyramid handoff",
+        "poll_url": f"/api/trading/stop-simulation/{session_id}/status",
         "timing_ms": _sim_plugin_elapsed_ms(endpoint_started_perf),
     }
     _sim_plugin_log(
-        "POST /api/trading/stop-simulation EXIT success",
+        "POST /api/trading/stop-simulation EXIT async 202",
         session_id=session_id,
-        configuration_id=post_restore_configuration_id,
         total_elapsed_ms=_sim_plugin_elapsed_ms(endpoint_started_perf),
     )
-    return response_payload
+    return JSONResponse(status_code=202, content=accepted_payload)
+
+
+@app.get("/api/trading/stop-simulation/{session_id}/status")
+async def get_stop_simulation_status(session_id: str, x_plugin_api_key: str = Header(None)):
+    """
+    Poll async simulation stop progress. When status=completed, returns the same payload
+    as a successful synchronous stop-simulation (including authenticated session for live handoff).
+    """
+    job = SessionManager.read_stop_job(session_id)
+    if not job:
+        session_exists, _ = await _lookup_stop_simulation_session(session_id)
+        if not session_exists:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {
+            "success": True,
+            "ready": False,
+            "status": "not_started",
+            "session_id": session_id,
+            "message": "No stop job found for this session",
+        }
+
+    job_status = job.get("status")
+
+    if job_status == "stopping":
+        return {
+            "success": True,
+            "accepted": True,
+            "ready": False,
+            "status": "stopping",
+            "phase": job.get("phase"),
+            "session_id": session_id,
+            "started_at": job.get("started_at"),
+            "poll_url": f"/api/trading/stop-simulation/{session_id}/status",
+        }
+
+    if job_status == "failed":
+        return {
+            "success": False,
+            "ready": True,
+            "status": "failed",
+            "session_id": session_id,
+            "error": job.get("error") or "Simulation stop failed",
+        }
+
+    if job_status == "completed":
+        cached = job.get("response")
+        if job.get("finalized") and isinstance(cached, dict):
+            return cached
+
+        _, db_record = await _lookup_stop_simulation_session(session_id)
+        pyramid_handoff = (
+            job.get("pyramid")
+            or SessionManager.read_pyramid_handoff_result(session_id)
+            or {}
+        )
+        response_payload = await _finalize_stop_simulation_response(
+            session_id,
+            pyramid_handoff,
+            db_record,
+        )
+        SessionManager.update_stop_job(
+            session_id,
+            finalized=True,
+            response=response_payload,
+        )
+        return response_payload
+
+    return {
+        "success": True,
+        "ready": False,
+        "status": job_status or "unknown",
+        "session_id": session_id,
+    }
 
 
 @app.post("/api/trading/stop/{session_id}")  #changed this one also 
@@ -3063,3 +3273,8 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
+
+
+
+
+

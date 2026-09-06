@@ -322,22 +322,27 @@ class MarketClient:
 
     def _init_redis(self):
         try:
-            if os.environ.get("REDIS_CLUSTER", "").lower() in ("1", "true", "yes"):
-                self.redis_client = redis.RedisCluster(
-                    host=os.environ.get("REDIS_HOST", "10.45.41.115"),
-                    port=int(os.environ.get("REDIS_PORT", "6379")),
-                    ssl=True,
-                    ssl_cert_reqs=None,
-                    decode_responses=True,
-                    socket_connect_timeout=5,
-                )
-            else:
-                self.redis_client = redis.Redis(
-                    host=os.environ.get("REDIS_HOST", "127.0.0.1"),
-                    port=int(os.environ.get("REDIS_PORT", "6379")),
-                    decode_responses=True,
-                    socket_connect_timeout=5,
-                )
+            redis_host_raw = os.environ.get(
+                "REDIS_HOST",
+                "clustercfg.mintzy-redis.ci2qc0.use1.cache.amazonaws.com",
+            )
+            redis_host = redis_host_raw
+            redis_port = int(os.environ.get("REDIS_PORT", "6379"))
+            if ":" in redis_host_raw:
+                redis_host, redis_port_raw = redis_host_raw.rsplit(":", 1)
+                if redis_port_raw:
+                    redis_port = int(redis_port_raw)
+
+            # AWS ElastiCache cluster mode always needs RedisCluster + TLS
+            # (same as mintzy-plugin-updated; do not use plain Redis here).
+            self.redis_client = redis.RedisCluster(
+                host=redis_host,
+                port=redis_port,
+                ssl=True,
+                ssl_cert_reqs=None,
+                decode_responses=True,
+                socket_connect_timeout=5,
+            )
             self.redis_client.ping()
             print("[MARKET CLIENT] Redis connected")
         except Exception as e:
@@ -348,12 +353,27 @@ class MarketClient:
         self.access_token = get_access_token()
 
     def _load_ticker_map(self):
-        try:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            with open(os.path.join(base_dir, "ticker.json")) as f:
-                self.ticker_map = json.load(f)
-        except Exception:
-            self.ticker_map = {}
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates = []
+        env_path = os.environ.get("TICKER_JSON_PATH", "").strip()
+        if env_path:
+            candidates.append(env_path)
+        candidates.extend([
+            os.path.join(base_dir, "ticker.json"),
+            os.path.join(base_dir, "utils", "ticker.json"),
+        ])
+        for path in candidates:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    self.ticker_map = json.load(f)
+                print(f"[MARKET CLIENT] Loaded {len(self.ticker_map)} Upstox instrument keys from {path}")
+                return
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                print(f"[MARKET CLIENT] Failed to load ticker map from {path}: {e}")
+        print("[MARKET CLIENT] WARNING: ticker.json not found — Upstox LTP will fall back to predictions")
+        self.ticker_map = {}
 
     # ---------------- LIVE PRICE ----------------
 

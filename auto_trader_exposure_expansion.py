@@ -43,6 +43,14 @@ PYR_MULTS = [1.40, 1.30, 1.20, 1.00, 1.00, 0.75, 0.75, 0.75, 0.75, 0.75]
 # Nifty intraday leverage: use 4x of account free cash for pyramid allocation headroom
 PYRAMID_LEVERAGE_MULTIPLIER = float(os.environ.get("PYRAMID_LEVERAGE_MULTIPLIER", "1"))
 
+# TEMP TEST: when set, trading + pyramid use this cash instead of live RMS (avoids deploying full broker cash).
+# Default 30000 for sim→live testing. Set env PYRAMID_FREE_CASH_OVERRIDE=none to use real RMS again.
+_raw_pyramid_cash_override = os.environ.get("PYRAMID_FREE_CASH_OVERRIDE", "30000")
+if str(_raw_pyramid_cash_override).strip().lower() in ("", "none", "null"):
+    PYRAMID_FREE_CASH_OVERRIDE = None
+else:
+    PYRAMID_FREE_CASH_OVERRIDE = float(_raw_pyramid_cash_override)
+
 
 def pyramid_multiplier_for_rank(rank) -> Optional[float]:
     try:
@@ -57,6 +65,31 @@ def pyramid_multiplier_for_rank(rank) -> Optional[float]:
     return PYR_MULTS[idx]
 
 
+# Rank-based min profit as % of allocated capital (percent, not decimal)
+PYR_PROFIT_THRESHOLD_PCT = {
+    1: 0.0576,
+    2: 0.0638,
+    3: 0.0744,
+    4: 0.0893,
+    5: 0.0893,
+    6: 0.1190,
+    7: 0.1374,
+    8: 0.1374,
+    9: 0.1374,
+    10: 0.1374,
+}
+
+
+def pyramid_profit_threshold_for_rank(rank, capital_allocated: float) -> Optional[float]:
+    """Min unrealized PnL (Rs) to count as profitable: capital × rank % of allocated."""
+    try:
+        rank_key = int(rank)
+    except (TypeError, ValueError):
+        return None
+    if rank_key < 1 or capital_allocated <= 0:
+        return None
+    pct = PYR_PROFIT_THRESHOLD_PCT.get(rank_key, PYR_PROFIT_THRESHOLD_PCT[10])
+    return float(capital_allocated) * (pct / 100.0)
 
 
 # ==================== TIMING LOGGER ====================
@@ -611,6 +644,7 @@ class AutoTrader:
         self._shutdown_done = False
         self.positions_lock = threading.Lock()   #  ADD THIS LINE
         self._exited_symbols = set()  # Symbols manually exited Ã¢â‚¬â€ excluded from future cycles
+        self._exited_symbols_index_ready = False
 
         # ==================== RMS: RISK MANAGEMENT SYSTEM ====================
         self.rms_triggered = False          # True once daily loss limit is hit
@@ -633,6 +667,7 @@ class AutoTrader:
         self.live_pnl_lock = threading.Lock()
         self._live_pnl_last_write: dict = {}     # throttle CSV writes per symbol
         self._live_pnl_last_redis_write: float = 0.0   # throttle Redis writes (max 1/sec globally)
+        self._live_pnl_debug_last: dict = {}
         self.live_pnl_log = os.path.join(self.log_dir, "live_pnl_log.csv")
         self.portfolio_pnl_log = os.path.join(self.log_dir, "portfolio_pnl_log.csv")
         self.rms_events_log = os.path.join(self.log_dir, "rms_events_log.csv")
@@ -702,6 +737,20 @@ class AutoTrader:
                     "Return_On_Trade(%)", "Portfolio_Return(%)"
                 ])
     
+    def _debug_live_pnl(self, key: str, message: str, interval: float = 10.0) -> None:
+        try:
+            now = time.time()
+            last_by_key = getattr(self, "_live_pnl_debug_last", None)
+            if last_by_key is None:
+                self._live_pnl_debug_last = {}
+                last_by_key = self._live_pnl_debug_last
+            last = float(last_by_key.get(key, 0.0) or 0.0)
+            if interval <= 0 or now - last >= interval:
+                last_by_key[key] = now
+                print(message, flush=True)
+        except Exception:
+            pass
+
     # ---------- LIVE LTP TICK (background WS thread) ----------
     def on_ltp_tick(self, symbol: str, ltp: float, ts_epoch: float) -> None:
         """
@@ -710,16 +759,45 @@ class AutoTrader:
         Does NOT mutate any field used by the existing PnL pipeline.
         """
         try:
+            sid = getattr(self, "session_id", None) or getattr(self, "ui_session_id", None)
             pos = self.positions.get(symbol)
+            self._debug_live_pnl(
+                f"tick:received:{symbol}",
+                (
+                    f"[LIVE-PNL-TICK] received session={sid} symbol={symbol} "
+                    f"ltp={float(ltp or 0.0):.2f} has_position={bool(pos)} "
+                    f"positions={list((self.positions or {}).keys())} "
+                    f"paper_positions={list((getattr(self, '_paper_positions', {}) or {}).keys())}"
+                ),
+                interval=10.0,
+            )
             if not pos:
                 if symbol not in self._tick_first_seen_in_trader:
                     self._tick_first_seen_in_trader.add(symbol)
                     print(f"[TRADER-TICK] {symbol} tick received but no position yet (ltp={ltp:.2f})")
+                self._debug_live_pnl(
+                    f"tick:skip:no-pos:{symbol}",
+                    (
+                        f"[LIVE-PNL-TICK] skip_no_position session={sid} symbol={symbol} "
+                        f"ltp={float(ltp or 0.0):.2f} "
+                        f"positions={list((self.positions or {}).keys())} "
+                        f"paper_positions={list((getattr(self, '_paper_positions', {}) or {}).keys())}"
+                    ),
+                    interval=10.0,
+                )
                 return
             qty = int(pos.get("qty") or 0)
             entry = float(pos.get("entry_price") or 0.0)
             side = (pos.get("side") or "BUY").upper()
             if qty <= 0 or entry <= 0:
+                self._debug_live_pnl(
+                    f"tick:skip:bad-pos:{symbol}",
+                    (
+                        f"[LIVE-PNL-TICK] skip_invalid_position session={sid} symbol={symbol} "
+                        f"qty={qty} entry={entry:.2f} side={side} raw_pos={pos}"
+                    ),
+                    interval=10.0,
+                )
                 return
 
             pnl = (ltp - entry) * qty if side == "BUY" else (entry - ltp) * qty
@@ -740,6 +818,19 @@ class AutoTrader:
                     "side": side,
                     "ts": ts_epoch,
                 }
+                live_symbols = list(self.live_pnl.keys())
+            self._debug_live_pnl(
+                f"tick:update:{symbol}",
+                (
+                    f"[LIVE-PNL-TICK] updated session={sid} symbol={symbol} side={side} "
+                    f"qty={qty} entry={entry:.2f} ltp={float(ltp or 0.0):.2f} "
+                    f"unrealized={pnl:.2f} live_symbols={live_symbols}"
+                ),
+                interval=5.0,
+            )
+            with self._paper_lock:
+                if symbol in self._paper_positions:
+                    self._paper_positions[symbol]["ltp"] = ltp
                 last = self._live_pnl_last_write.get(symbol, 0.0)
                 if ts_epoch - last >= 1.0:
                     self._live_pnl_last_write[symbol] = ts_epoch
@@ -831,6 +922,14 @@ class AutoTrader:
             sid = getattr(self, "session_id", None) or getattr(self, "ui_session_id", None)
             rc = getattr(self.market_client, "redis_client", None)
             if not sid or rc is None:
+                self._debug_live_pnl(
+                    "redis:skip:missing-context",
+                    (
+                        f"[LIVE-PNL-REDIS] skip missing_context session={sid} "
+                        f"redis={'YES' if rc is not None else 'NO'}"
+                    ),
+                    interval=10.0,
+                )
                 return
 
             # Snapshot live_pnl and realized_pnl_by_symbol safely
@@ -838,15 +937,28 @@ class AutoTrader:
                 live_snapshot = dict(self.live_pnl)
 
             realized_by_sym = dict(self.realized_pnl_by_symbol)
+            if not live_snapshot:
+                self._debug_live_pnl(
+                    f"redis:empty-live:{sid}",
+                    (
+                        f"[LIVE-PNL-REDIS] live_snapshot_empty session={sid} "
+                        f"positions={list((self.positions or {}).keys())} "
+                        f"paper_positions={list((getattr(self, '_paper_positions', {}) or {}).keys())} "
+                        f"realized_symbols={list(realized_by_sym.keys())}"
+                    ),
+                    interval=10.0,
+                )
 
             # Build per-symbol response — merge open positions + closed-only symbols
             all_symbols = set(live_snapshot.keys()) | set(realized_by_sym.keys())
             symbols_out = {}
             live_unrealized_total = 0.0
+            exited_symbols = set(getattr(self, "_exited_symbols", set()) or set())
 
             for sym in all_symbols:
                 live = live_snapshot.get(sym, {})
-                unrealized = round(float(live.get("pnl", 0.0)), 2)
+                is_exited = sym in exited_symbols or str(live.get("status") or "").upper() == "EXITED"
+                unrealized = 0.0 if is_exited else round(float(live.get("pnl", 0.0)), 2)
                 realized = round(float(realized_by_sym.get(sym, 0.0)), 2)
                 live_unrealized_total += unrealized
                 symbols_out[sym] = {
@@ -854,9 +966,11 @@ class AutoTrader:
                     "unrealized_pnl": unrealized,
                     "realized_pnl": realized,
                     "total_pnl": round(unrealized + realized, 2),
-                    "qty": int(live.get("qty", 0)),
+                    "qty": 0 if is_exited else int(live.get("qty", 0)),
                     "entry": round(float(live.get("entry", 0.0)), 2),
                     "side": live.get("side", ""),
+                    "position_status": "EXITED" if is_exited else "OPEN",
+                    "exit_reason": live.get("exit_reason") if is_exited else None,
                 }
 
             realized_total = round(float(self.realized_pnl), 2)
@@ -871,6 +985,15 @@ class AutoTrader:
             }
 
             rc.setex(f"live_pnl:{sid}", 5, json.dumps(payload))
+            self._debug_live_pnl(
+                f"redis:write:{sid}",
+                (
+                    f"[LIVE-PNL-REDIS] setex key=live_pnl:{sid} ttl=5 "
+                    f"symbols={list(symbols_out.keys())} realized={realized_total:.2f} "
+                    f"live_unrealized={live_unrealized_total:.2f} total={payload['total_pnl']:.2f}"
+                ),
+                interval=5.0,
+            )
 
         except Exception as e:
             print(f"[LIVE-PNL] Redis push error: {e}")
@@ -1046,14 +1169,21 @@ class AutoTrader:
 
     def _rms_exit_worker(self, symbol: str) -> None:
         """Run exit_single_position off the WS thread."""
+        sym = self._normalize_config_symbol(symbol)
+        print(f"[RMS-TICKER] worker start symbol={sym} reason=RMS_TICKER_EXIT")
         try:
-            self.exit_single_position(symbol)
+            result = self.exit_single_position(sym, exit_reason="RMS_TICKER_EXIT")
+            print(
+                f"[RMS-TICKER] worker done symbol={sym} "
+                f"success={result.get('success')} order_id={result.get('order_id')} "
+                f"message={result.get('message')}"
+            )
         except Exception as e:
-            print(f"[RMS-TICKER] exit failed for {symbol}: {e}")
+            print(f"[RMS-TICKER] exit failed for {sym}: {e}")
         finally:
             # exit_single_position adds to _exited_symbols on success;
             # drop the inflight marker either way so a retry is possible if it failed.
-            self._rms_exit_inflight.discard(symbol)
+            self._rms_exit_inflight.discard(sym)
 
     def _notify_rms_exit_to_api(self, symbol: str, pnl: float) -> None:
         """
@@ -1070,8 +1200,471 @@ class AutoTrader:
                 json.dumps({"symbol": symbol, "pnl": pnl, "ts": time.time()}),
             )
             rc.expire(f"autotrader:rms_exited:{sid}", 86400)
+            print(f"[RMS-TICKER] redis notify queued session={sid} symbol={symbol} pnl={float(pnl or 0.0):.2f}")
         except Exception as e:
             print(f"[RMS-TICKER] redis notify failed for {symbol}: {e}")
+
+    def _get_session_id_for_db(self) -> str:
+        sid = getattr(self, "ui_session_id", None) or getattr(self, "session_id", None)
+        return str(sid or "").strip()
+
+    def _get_source_mode(self) -> str:
+        session = getattr(self, "session", None)
+        if isinstance(session, dict) and session.get("paper"):
+            return "simulation"
+        return "live"
+
+    def _get_exit_cycle_numbers(self) -> tuple:
+        actual_cycle = int(
+            getattr(self, "_current_cycle_count", 0)
+            or getattr(self, "_restored_cycle_count", 0)
+            or 0
+        )
+        return actual_cycle, max(actual_cycle + 1, 1)
+
+    def _get_exited_symbols_collection(self):
+        base = self.trading_logs_collection
+        if base is None:
+            return None
+        db_name = self._resolve_config_db_name()
+        coll = (
+            base.database.client[db_name]["exited_symbols"]
+            if db_name != base.database.name
+            else base.database["exited_symbols"]
+        )
+        if not self._exited_symbols_index_ready:
+            try:
+                coll.create_index(
+                    [("session_id", 1), ("symbol", 1)],
+                    unique=True,
+                    name="uniq_session_symbol_exit",
+                )
+                coll.create_index(
+                    [("session_id", 1), ("status", 1)],
+                    name="idx_session_exit_status",
+                )
+            except Exception as exc:
+                print(f"[EXITED-SYMBOLS] index ensure failed: {exc}")
+            self._exited_symbols_index_ready = True
+        return coll
+
+    def _snapshot_position_for_exit(self, symbol: str, fallback: Optional[dict] = None) -> dict:
+        sym = self._normalize_config_symbol(symbol)
+        with self.positions_lock:
+            pos = self.positions.get(sym)
+            if pos:
+                return {
+                    "symbol": sym,
+                    "side": pos.get("side"),
+                    "qty": int(pos.get("qty") or 0),
+                    "entry_price": float(pos.get("entry_price") or 0.0),
+                    "ltp": float(pos.get("ltp") or 0.0),
+                }
+
+        with self._paper_lock:
+            pos = self._paper_positions.get(sym)
+            if pos:
+                return {
+                    "symbol": sym,
+                    "side": pos.get("side"),
+                    "qty": int(pos.get("qty") or 0),
+                    "entry_price": float(pos.get("avg_price") or pos.get("entry_price") or 0.0),
+                    "ltp": float(pos.get("ltp") or 0.0),
+                }
+
+        fallback = fallback or {}
+        return {
+            "symbol": sym,
+            "side": fallback.get("side"),
+            "qty": int(fallback.get("qty") or 0),
+            "entry_price": float(fallback.get("entry_price") or fallback.get("avg_price") or 0.0),
+            "ltp": float(fallback.get("ltp") or 0.0),
+        }
+
+    def _exit_action_label(self, exit_reason: str) -> str:
+        labels = {
+            "RMS_TICKER_EXIT": "RMS EXITED",
+            "STOP_LOSS_EXIT": "STOP LOSS EXITED",
+            "MANUAL_EXIT": "MANUAL EXITED",
+            "PORTFOLIO_RMS_EXIT": "PORTFOLIO RMS EXITED",
+        }
+        return labels.get(exit_reason or "", "EXITED")
+
+    def _resolve_exit_reason(self, action_type: str, ctx: Optional[dict] = None) -> str:
+        ctx = ctx or {}
+        explicit = ctx.get("exit_reason")
+        if explicit:
+            return str(explicit).upper()
+        if action_type == "STOP_LOSS":
+            return "STOP_LOSS_EXIT"
+        if action_type in ("EXIT_LONG", "COVER_SHORT"):
+            return "MANUAL_EXIT"
+        return "EXIT"
+
+    def _clear_symbol_live_pnl_after_exit(
+        self,
+        symbol: str,
+        *,
+        exit_price: float = 0.0,
+        entry_price: float = 0.0,
+        side: str = "",
+        exit_reason: str = "",
+    ) -> None:
+        sym = self._normalize_config_symbol(symbol)
+        self._exited_symbols.add(sym)
+        with self.live_pnl_lock:
+            old = self.live_pnl.get(sym, {})
+            self.live_pnl[sym] = {
+                "ltp": float(exit_price or old.get("ltp") or 0.0),
+                "pnl": 0.0,
+                "qty": 0,
+                "entry": float(entry_price or old.get("entry") or 0.0),
+                "side": side or old.get("side", ""),
+                "ts": time.time(),
+                "status": "EXITED",
+                "exit_reason": exit_reason,
+            }
+        with self._paper_lock:
+            self._paper_positions.pop(sym, None)
+        print(
+            f"[EXITED-SYMBOLS] live pnl cleared session={self._get_session_id_for_db()} "
+            f"symbol={sym} reason={exit_reason} exit_price={float(exit_price or 0.0):.2f}"
+        )
+
+    def _persist_exit_pending(
+        self,
+        symbol: str,
+        *,
+        exit_reason: str,
+        exit_side: str,
+        qty: int,
+        entry_price: float,
+        exit_order_id: Optional[str],
+    ) -> None:
+        sid = self._get_session_id_for_db()
+        coll = self._get_exited_symbols_collection()
+        if not sid or coll is None:
+            print(
+                f"[EXITED-SYMBOLS] pending persist skipped symbol={symbol} "
+                f"session_present={bool(sid)} collection_present={coll is not None}"
+            )
+            return
+
+        actual_cycle, display_cycle = self._get_exit_cycle_numbers()
+        now_market = self._now_market_time()
+        now_utc = datetime.now(timezone.utc)
+        sym = self._normalize_config_symbol(symbol)
+        try:
+            existing = coll.find_one({"session_id": sid, "symbol": sym}, {"status": 1})
+            if existing and str(existing.get("status") or "").upper() in {"EXITED", "RMS_EXITED", "CLOSED"}:
+                return
+        except Exception:
+            pass
+
+        pending_unrealized = self._get_symbol_unrealized_pnl(sym)
+        doc = {
+            "session_id": sid,
+            "configuration_id": getattr(self, "configuration_id", None),
+            "symbol": sym,
+            "status": "EXIT_PENDING",
+            "position_status": "EXIT_PENDING",
+            "exit_reason": exit_reason,
+            "entry_side": "BUY" if exit_side == "SELL" else "SELL",
+            "exit_side": exit_side,
+            "qty": int(qty or 0),
+            "entry_price": round(float(entry_price or 0.0), 2),
+            "exit_price": None,
+            "realized_pnl": 0.0,
+            "unrealized_pnl": pending_unrealized,
+            "total_pnl": pending_unrealized,
+            "exit_actual_cycle": actual_cycle,
+            "display_cycle": display_cycle,
+            "exit_order_id": exit_order_id,
+            "exit_order_status": "PENDING",
+            "source": self._get_source_mode(),
+            "exit_time": None,
+            "exit_time_utc": None,
+            "updated_at": now_utc.isoformat(),
+        }
+        try:
+            coll.update_one(
+                {"session_id": sid, "symbol": sym},
+                {"$set": doc, "$setOnInsert": {"created_at": now_utc.isoformat(), "requested_at": now_market.strftime("%Y-%m-%d %H:%M:%S")}},
+                upsert=True,
+            )
+            print(
+                f"[EXITED-SYMBOLS] pending saved session={sid} symbol={sym} "
+                f"reason={exit_reason} order_id={exit_order_id} "
+                f"actual_cycle={actual_cycle} display_cycle={display_cycle} "
+                f"unrealized={pending_unrealized:.2f}"
+            )
+        except Exception as exc:
+            print(f"[EXITED-SYMBOLS] pending persist failed for {sym}: {exc}")
+
+    def _persist_exit_trading_log(self, exit_doc: dict) -> None:
+        coll = self.trading_logs_collection
+        if coll is None:
+            print(f"[TRADING-LOGS] exit row skipped symbol={exit_doc.get('symbol')} collection_present=False")
+            return
+
+        sid = exit_doc.get("session_id")
+        sym = exit_doc.get("symbol")
+        if not sid or not sym:
+            print(f"[TRADING-LOGS] exit row skipped missing session/symbol session={sid} symbol={sym}")
+            return
+
+        display_cycle = int(exit_doc.get("display_cycle") or 1)
+        realized = round(float(exit_doc.get("realized_pnl") or 0.0), 2)
+        total = round(float(exit_doc.get("total_pnl") or realized), 2)
+        timestamp = exit_doc.get("exit_time") or self._now_market_time().strftime("%Y-%m-%d %H:%M:%S")
+        portfolio_unrealized = round(float(getattr(self, "unrealized_pnl", 0.0) or 0.0), 2)
+        portfolio_realized = round(float(getattr(self, "realized_pnl", 0.0) or 0.0), 2)
+        portfolio_pnl = round(portfolio_realized + portfolio_unrealized, 2)
+        total_equity = round(float(self.cash_balance or 0.0) + portfolio_realized + portfolio_unrealized, 2)
+
+        row = {
+            "session_id": sid,
+            "configuration_id": exit_doc.get("configuration_id"),
+            "cycle": display_cycle,
+            "timestamp": timestamp,
+            "simulation_logs": bool(getattr(self, "simulation_logs", True)),
+            "symbol": sym,
+            "curr_price": exit_doc.get("exit_price"),
+            "return_pct": 0.0,
+            "trajectory_pct": None,
+            "side": exit_doc.get("entry_side"),
+            "signal": None,
+            "action": self._exit_action_label(exit_doc.get("exit_reason")),
+            "qty": int(exit_doc.get("qty") or 0),
+            "unrealized_pnl": 0.0,
+            "symbol_unrealized_pnl": 0.0,
+            "symbol_realized_pnl": realized,
+            "exit_realized_pnl": exit_doc.get("exit_realized_pnl", realized),
+            "symbol_pnl": total,
+            "cash_balance": round(float(self.cash_balance or 0.0), 2),
+            "realized_pnl": portfolio_realized,
+            "pnl": total,
+            "total_equity": total_equity,
+            "portfolio_cash_balance": round(float(self.cash_balance or 0.0), 2),
+            "portfolio_realized_pnl": portfolio_realized,
+            "portfolio_unrealized_pnl": portfolio_unrealized,
+            "portfolio_pnl": portfolio_pnl,
+            "portfolio_total_equity": total_equity,
+            "is_exit_row": True,
+            "source": "exited_symbols",
+            "status": exit_doc.get("status"),
+            "position_status": exit_doc.get("position_status") or exit_doc.get("status"),
+            "exit_reason": exit_doc.get("exit_reason"),
+            "exit_side": exit_doc.get("exit_side"),
+            "entry_price": exit_doc.get("entry_price"),
+            "exit_price": exit_doc.get("exit_price"),
+            "exit_order_id": exit_doc.get("exit_order_id"),
+            "exit_order_status": exit_doc.get("exit_order_status"),
+            "exit_actual_cycle": exit_doc.get("exit_actual_cycle"),
+            "display_cycle": display_cycle,
+            "exit_time": exit_doc.get("exit_time"),
+            "exit_time_utc": exit_doc.get("exit_time_utc"),
+        }
+        try:
+            coll.update_one(
+                {"session_id": sid, "symbol": sym, "is_exit_row": True},
+                {"$set": row, "$setOnInsert": {"created_at": datetime.now(timezone.utc).isoformat()}},
+                upsert=True,
+            )
+            print(
+                f"[TRADING-LOGS] exit row upserted session={sid} symbol={sym} "
+                f"cycle={display_cycle} actual_cycle={exit_doc.get('exit_actual_cycle')} "
+                f"reason={exit_doc.get('exit_reason')} realized={realized:.2f} "
+                f"unrealized=0.00 order_id={exit_doc.get('exit_order_id')}"
+            )
+        except Exception as exc:
+            print(f"[TRADING-LOGS] exit row persist failed for {sym}: {exc}")
+
+    def _persist_symbol_exit(
+        self,
+        symbol: str,
+        *,
+        exit_reason: str,
+        action_type: str,
+        exit_side: str,
+        qty: int,
+        entry_price: float,
+        exit_price: float,
+        realized_pnl: float,
+        exit_order_id: Optional[str],
+        exit_order_status: str = "FILLED",
+    ) -> dict:
+        sid = self._get_session_id_for_db()
+        actual_cycle, display_cycle = self._get_exit_cycle_numbers()
+        sym = self._normalize_config_symbol(symbol)
+        now_market = self._now_market_time()
+        now_utc = datetime.now(timezone.utc)
+        exit_realized_pnl = round(float(realized_pnl or 0.0), 2)
+        cumulative_realized_pnl = round(
+            float(self.realized_pnl_by_symbol.get(sym, exit_realized_pnl) or exit_realized_pnl),
+            2,
+        )
+        total_pnl = cumulative_realized_pnl
+        entry_side = "BUY" if exit_side == "SELL" else "SELL"
+        doc = {
+            "session_id": sid,
+            "configuration_id": getattr(self, "configuration_id", None),
+            "symbol": sym,
+            "status": "EXITED",
+            "position_status": "EXITED",
+            "exit_reason": exit_reason,
+            "action_type": action_type,
+            "entry_side": entry_side,
+            "exit_side": exit_side,
+            "qty": int(qty or 0),
+            "entry_price": round(float(entry_price or 0.0), 2),
+            "exit_price": round(float(exit_price or 0.0), 2),
+            "exit_realized_pnl": exit_realized_pnl,
+            "realized_pnl": cumulative_realized_pnl,
+            "unrealized_pnl": 0.0,
+            "total_pnl": total_pnl,
+            "exit_actual_cycle": actual_cycle,
+            "display_cycle": display_cycle,
+            "exit_time": now_market.strftime("%Y-%m-%d %H:%M:%S"),
+            "exit_time_utc": now_utc.isoformat(),
+            "source": self._get_source_mode(),
+            "exit_order_id": exit_order_id,
+            "exit_order_status": exit_order_status,
+            "updated_at": now_utc.isoformat(),
+        }
+
+        coll = self._get_exited_symbols_collection()
+        if sid and coll is not None:
+            try:
+                coll.update_one(
+                    {"session_id": sid, "symbol": sym},
+                    {"$set": doc, "$setOnInsert": {"created_at": now_utc.isoformat()}},
+                    upsert=True,
+                )
+                print(
+                    f"[EXITED-SYMBOLS] final saved session={sid} symbol={sym} "
+                    f"reason={exit_reason} status=EXITED order_id={exit_order_id} "
+                    f"entry={entry_price:.2f} exit={exit_price:.2f} qty={int(qty or 0)} "
+                    f"exit_realized={exit_realized_pnl:.2f} cumulative_realized={cumulative_realized_pnl:.2f} "
+                    f"display_cycle={display_cycle}"
+                )
+            except Exception as exc:
+                print(f"[EXITED-SYMBOLS] persist failed for {sym}: {exc}")
+        else:
+            print(
+                f"[EXITED-SYMBOLS] final persist skipped symbol={sym} "
+                f"session_present={bool(sid)} collection_present={coll is not None}"
+            )
+
+        self._persist_exit_trading_log(doc)
+        return doc
+
+    def _get_exited_symbol_doc(self, symbol: str) -> Optional[dict]:
+        sid = self._get_session_id_for_db()
+        coll = self._get_exited_symbols_collection()
+        sym = self._normalize_config_symbol(symbol)
+        if not sid or coll is None or not sym:
+            return None
+        try:
+            doc = coll.find_one({"session_id": sid, "symbol": sym})
+            if doc and str(doc.get("status") or "").upper() in {"EXITED", "RMS_EXITED", "CLOSED"}:
+                print(
+                    f"[EXITED-SYMBOLS] found closed symbol session={sid} symbol={sym} "
+                    f"status={doc.get('status')} reason={doc.get('exit_reason')} "
+                    f"realized={doc.get('realized_pnl')} unrealized={doc.get('unrealized_pnl')}"
+                )
+                return doc
+        except Exception as exc:
+            print(f"[EXITED-SYMBOLS] lookup failed for {sym}: {exc}")
+        return None
+
+    def _sync_exited_symbols_from_db(self) -> None:
+        sid = self._get_session_id_for_db()
+        coll = self._get_exited_symbols_collection()
+        if not sid or coll is None:
+            return
+        try:
+            cursor = coll.find(
+                {"session_id": sid, "status": {"$in": ["EXIT_PENDING", "EXITED", "RMS_EXITED", "CLOSED"]}},
+                {"symbol": 1},
+            )
+            synced = set()
+            for doc in cursor:
+                sym = self._normalize_config_symbol(doc.get("symbol"))
+                if sym:
+                    synced.add(sym)
+            if synced:
+                before = len(self._exited_symbols)
+                self._exited_symbols.update(synced)
+                if len(self._exited_symbols) > before:
+                    print(f"[EXITED-SYMBOLS] Synced from DB: {sorted(synced)}")
+        except Exception as exc:
+            print(f"[EXITED-SYMBOLS] sync failed: {exc}")
+
+    def _finalize_symbol_exit_fill(self, symbol: str, broker_pos: dict, ctx: dict) -> dict:
+        sym = self._normalize_config_symbol(symbol)
+        action_type = ctx.get("action_type", "")
+        exit_reason = self._resolve_exit_reason(action_type, ctx)
+        exit_price = float(broker_pos.get("avg_price") or 0.0)
+        exit_qty = int(broker_pos.get("qty") or ctx.get("qty") or 0)
+        exit_side = (ctx.get("side") or broker_pos.get("side") or "").upper()
+        pre_exit = ctx.get("pre_exit_position") or self._snapshot_position_for_exit(sym)
+        entry_price = float(pre_exit.get("entry_price") or 0.0)
+        entry_side = pre_exit.get("side") or ("BUY" if exit_side == "SELL" else "SELL")
+        print(
+            f"[EXIT-FINALIZE] start symbol={sym} action={action_type} reason={exit_reason} "
+            f"entry_side={entry_side} exit_side={exit_side} qty={exit_qty} "
+            f"entry={entry_price:.2f} exit={exit_price:.2f} order_id={ctx.get('order_id')}"
+        )
+
+        pnl = self._close_position(
+            self.session,
+            sym,
+            exit_price,
+            exit_qty,
+            position_snapshot=pre_exit,
+        )
+        print(f"[P&L REALIZED] {sym} | Action: {action_type} | Reason: {exit_reason} | Realized: {pnl:.2f}")
+
+        self._log_trade(
+            sym,
+            action_type,
+            0.0,
+            "closed",
+            exit_price,
+            exit_qty,
+            pnl,
+        )
+
+        remaining_qty = self._get_symbol_position_qty(sym)
+        if remaining_qty <= 0:
+            self._clear_symbol_live_pnl_after_exit(
+                sym,
+                exit_price=exit_price,
+                entry_price=entry_price,
+                side=entry_side,
+                exit_reason=exit_reason,
+            )
+
+        exit_doc = self._persist_symbol_exit(
+            sym,
+            exit_reason=exit_reason,
+            action_type=action_type,
+            exit_side=exit_side,
+            qty=exit_qty,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            realized_pnl=pnl,
+            exit_order_id=ctx.get("order_id"),
+            exit_order_status="FILLED",
+        )
+        self._persist_paper_state_snapshot(event=f"exit:{sym}")
+        print(
+            f"[EXIT-FINALIZE] done symbol={sym} reason={exit_reason} "
+            f"realized={exit_doc.get('realized_pnl')} unrealized={exit_doc.get('unrealized_pnl')} "
+            f"trading_log_cycle={exit_doc.get('display_cycle')}"
+        )
+        return exit_doc
 
     def _notify_eod_exit_status_to_api(self, reason: str = "MARKET_CLOSE_15:00_IST") -> None:
         """Publish EOD exit status so /api/trading/exit-status works across workers."""
@@ -1167,6 +1760,17 @@ class AutoTrader:
         t0 = time.time()
 
         result = (self._total_symbol_exposure(symbol) + order_value) <= (self.max_exposure_pct * self.initial_capital)
+        if result and PYRAMID_FREE_CASH_OVERRIDE is not None:
+            keys = set(self.reserved_exposure or {})
+            keys.update((self.positions or {}).keys())
+            portfolio = sum(self._total_symbol_exposure(s) for s in keys)
+            cap = float(PYRAMID_FREE_CASH_OVERRIDE)
+            if portfolio + order_value > cap:
+                print(
+                    f"[TEST-CASH-CAP] block {symbol} order_value={order_value:.2f} "
+                    f"portfolio={portfolio:.2f} cap={cap:.2f}"
+                )
+                result = False
 
         elapsed = time.time() - t0
 
@@ -1323,6 +1927,31 @@ class AutoTrader:
             exit_price = float(broker_pos.get("avg_price") or 0.0)
 
             # Step 2: P&L calculate karo (self.positions abhi bhi exist karti hai)
+            if (
+                action_type in {"EXIT_LONG", "COVER_SHORT", "STOP_LOSS"}
+                and exit_price > 0
+                and (symbol in self.positions or ctx.get("pre_exit_position"))
+            ):
+                exit_qty = broker_pos.get("qty", 0)
+                self._finalize_symbol_exit_fill(
+                    symbol,
+                    {
+                        "side": ctx.get("side") or broker_pos.get("side"),
+                        "qty": exit_qty,
+                        "avg_price": exit_price,
+                    },
+                    ctx,
+                )
+                if action_type in ("FLIP_TO_LONG", "FLIP_TO_SHORT"):
+                    print(f"[FLIP] {symbol}: old position closed, opening new {'LONG' if 'LONG' in action_type else 'SHORT'} position @ {exit_price:.2f}")
+                    with self.positions_lock:
+                        self.positions[symbol] = {
+                            "side": "BUY" if "LONG" in action_type else "SELL",
+                            "qty": broker_pos.get("qty", 0),
+                            "entry_price": exit_price,
+                        }
+                return
+
             if exit_price > 0 and symbol in self.positions:
                 exit_qty = broker_pos.get("qty", 0)
                 pnl = self._close_position(self.session, symbol, exit_price, exit_qty)
@@ -1336,6 +1965,7 @@ class AutoTrader:
                     exit_qty,
                     pnl
                 )
+                self._persist_paper_state_snapshot(event=f"exit:{symbol}")
                 # FLIP: purani position close ho gayi, ab nayi side OPEN karni hai
                 if action_type in ("FLIP_TO_LONG", "FLIP_TO_SHORT"):
                     print(f"[FLIP] {symbol}: old position closed, opening new {'LONG' if 'LONG' in action_type else 'SHORT'} position @ {exit_price:.2f}")
@@ -1440,11 +2070,6 @@ class AutoTrader:
 
     def _resolve_paper_ltp(self, symbol: str, order_req: Optional[OrderRequest] = None) -> float:
         symbol = symbol.upper().replace("-EQ", "")
-        with self.live_pnl_lock:
-            tick = self.live_pnl.get(symbol)
-            if tick and float(tick.get("ltp") or 0) > 0:
-                return float(tick["ltp"])
-
         cache = getattr(self, "_cycle_ltp_cache", {}) or {}
         cached = cache.get(symbol)
         if cached is not None and float(cached) > 0:
@@ -1459,6 +2084,11 @@ class AutoTrader:
             curr_price = order_req.metadata.get("curr_price")
             if curr_price is not None and float(curr_price) > 0:
                 return float(curr_price)
+
+        with self.live_pnl_lock:
+            tick = self.live_pnl.get(symbol)
+            if tick and float(tick.get("ltp") or 0) > 0:
+                return float(tick["ltp"])
 
         with self._paper_lock:
             pos = self._paper_positions.get(symbol)
@@ -1484,6 +2114,17 @@ class AutoTrader:
         pos = self._paper_positions.get(symbol)
 
         if action in flip_actions:
+            # Book realized PnL on the close leg before opening the flipped side.
+            if pos and int(pos.get("qty") or 0) > 0:
+                try:
+                    close_qty = int(pos["qty"])
+                    pnl = self._close_position(self.session, symbol, ltp, close_qty)
+                    print(
+                        f"[FLIP-PAPER] {symbol}: closed {pos.get('side')} x{close_qty} "
+                        f"@ {ltp:.2f} | realized={pnl:.2f}"
+                    )
+                except Exception as e:
+                    print(f"[FLIP-PAPER] {symbol}: close-leg PnL failed: {e}")
             new_qty = max(qty // 2, 0)
             if new_qty <= 0:
                 self._paper_positions.pop(symbol, None)
@@ -1672,6 +2313,10 @@ class AutoTrader:
 
     def _get_symbol_unrealized_pnl(self, symbol: str) -> float:
         symbol = symbol.upper().replace("-EQ", "")
+        if symbol in self._exited_symbols or self._get_exited_symbol_doc(symbol):
+            print(f"[PNL-GUARD] {symbol}: exited symbol -> unrealized_pnl forced to 0.00")
+            return 0.0
+
         with self.live_pnl_lock:
             tick = self.live_pnl.get(symbol)
             if tick is not None:
@@ -2350,24 +2995,38 @@ class AutoTrader:
         return None
 
     def _get_pyramid_free_cash(self) -> Optional[float]:
-        """Pyramid uses broker RMS cash, then session TOTP free_cash — never paper ledger."""
-        broker_cash = self._fetch_broker_free_cash(context="PYRAMID")
-        if broker_cash is not None:
-            return broker_cash
-
-        session_free = getattr(self, "session_free_cash", None)
-        if session_free is not None:
+        """Pyramid free cash: test override first — never live 97L RMS/session during test."""
+        override = PYRAMID_FREE_CASH_OVERRIDE
+        if override is not None:
             try:
-                parsed = float(session_free)
-                if parsed >= 0:
-                    print(f"[PYRAMID] using session_free_cash fallback: {parsed:,.2f}")
-                    return parsed
+                parsed_override = float(override)
+                if parsed_override >= 0:
+                    print(
+                        f"[PYRAMID] using PYRAMID_FREE_CASH_OVERRIDE={parsed_override:,.2f} "
+                        f"(skipping live RMS + session_free_cash for test sizing)"
+                    )
+                    return parsed_override
             except (TypeError, ValueError):
-                pass
+                print(f"[PYRAMID] invalid PYRAMID_FREE_CASH_OVERRIDE={override!r} — ignoring")
+
+        
+        # broker_cash = self._fetch_broker_free_cash(context="PYRAMID")
+        # if broker_cash is not None:
+        #     return broker_cash
+        #
+        # session_free = getattr(self, "session_free_cash", None)
+        # if session_free is not None:
+        #     try:
+        #         parsed = float(session_free)
+        #         if parsed >= 0:
+        #             print(f"[PYRAMID] using session_free_cash fallback: {parsed:,.2f}")
+        #             return parsed
+        #     except (TypeError, ValueError):
+        #         pass
 
         print(
-            "[PYRAMID] ABORT — no broker RMS cash and no session_free_cash; "
-            "refusing paper cash_balance fallback"
+            "[PYRAMID] ABORT — test override unavailable and RMS/session fallbacks disabled "
+            "(refusing real ~97L cash for pyramid sizing)"
         )
         return None
 
@@ -2389,6 +3048,37 @@ class AutoTrader:
             "symbols_for_live": symbols_for_live or [],
             "removed_symbols": removed_symbols or [],
         }
+
+    def _persist_pyramid_pnls(self, symbols: list, applied: bool = False, reason: str = None) -> None:
+        sid = getattr(self, "ui_session_id", None) or getattr(self, "session_id", None)
+        base = self.trading_logs_collection
+        if not sid or base is None:
+            return
+        db_name = self._resolve_config_db_name()
+        coll = (
+            base.database.client[db_name]["pyramid_pnls"]
+            if db_name != base.database.name
+            else base.database["pyramid_pnls"]
+        )
+        try:
+            coll.replace_one(
+                {"session_id": str(sid)},
+                {
+                    "session_id": str(sid),
+                    "configuration_id": getattr(self, "configuration_id", None),
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                    "pyramid_applied": applied,
+                    "reason": reason,
+                    "symbols": symbols,
+                },
+                upsert=True,
+            )
+        except Exception as exc:
+            print(f"[PYRAMID-PNL] persist failed: {exc}")
+
+    def _finish_pyramid_handoff(self, result: dict, pnl_rows: list) -> dict:
+        self._persist_pyramid_pnls(pnl_rows, applied=bool(result.get("applied")), reason=result.get("reason"))
+        return result
 
     def _symbols_for_live_from_entries(self, updated_by_symbol: dict) -> list:
         rows = []
@@ -2414,7 +3104,7 @@ class AutoTrader:
                 return cached
             return self._build_pyramid_handoff_result(
                 applied=True,
-                live_allowed=True,
+                live_allowed=False,
                 reason="already_applied",
             )
 
@@ -2423,7 +3113,7 @@ class AutoTrader:
             print("[PYRAMID] configuration_id missing — skipping capital pyramid update")
             return self._build_pyramid_handoff_result(
                 applied=False,
-                live_allowed=True,
+                live_allowed=False,
                 reason="configuration_id_missing",
             )
 
@@ -2431,7 +3121,7 @@ class AutoTrader:
         if not config_doc:
             return self._build_pyramid_handoff_result(
                 applied=False,
-                live_allowed=True,
+                live_allowed=False,
                 reason="configuration_not_found",
             )
 
@@ -2440,7 +3130,7 @@ class AutoTrader:
             print(f"[PYRAMID] configuration symbols not found for {configuration_id}")
             return self._build_pyramid_handoff_result(
                 applied=False,
-                live_allowed=True,
+                live_allowed=False,
                 reason="configuration_symbols_missing",
             )
 
@@ -2450,7 +3140,7 @@ class AutoTrader:
             print("[PYRAMID] No symbols with capital to evaluate — aborting update")
             return self._build_pyramid_handoff_result(
                 applied=False,
-                live_allowed=True,
+                live_allowed=False,
                 reason="no_symbols_to_evaluate",
             )
 
@@ -2464,14 +3154,15 @@ class AutoTrader:
             print("[PYRAMID] Skipping capital pyramid — real broker/session cash unavailable")
             return self._build_pyramid_handoff_result(
                 applied=False,
-                live_allowed=True,
+                live_allowed=False,
                 reason="broker_cash_unavailable",
             )
 
         raw_free_cash = float(free_cash)
         leverage_mult = self._resolve_leverage_multiplier(config_doc=config_doc, default=1.0)
         free_cash = raw_free_cash * leverage_mult
-        remaining_cash = free_cash - total_capital_allocated
+        # Distribute the full leveraged cash to pyramided names (do not subtract morning allocations).
+        remaining_cash = free_cash
         print(
             f"[PYRAMID] raw_free_cash={raw_free_cash:.2f} "
             f"leverage=x{leverage_mult} "
@@ -2484,12 +3175,64 @@ class AutoTrader:
         profitable = []
         removed = []
         removed_keys = set()
+        pnl_rows = []
         for sym_key, entry, cap in config_entries:
-            unrealized = self._get_symbol_unrealized_pnl(sym_key)
-            if unrealized > 0:
+            exit_doc = self._get_exited_symbol_doc(sym_key)
+            is_exited = bool(exit_doc)
+            if exit_doc:
+                realized = round(float(exit_doc.get("realized_pnl") or 0.0), 2)
+            else:
+                realized = round(float(self.realized_pnl_by_symbol.get(sym_key, 0.0) or 0.0), 2)
+            unrealized = 0.0 if is_exited else self._get_symbol_unrealized_pnl(sym_key)
+            total_pnl = round(realized + float(unrealized or 0.0), 2)
+            position_status = "EXITED" if is_exited else "OPEN"
+            exit_reason = (exit_doc or {}).get("exit_reason")
+            rank = entry.get("rank")
+            if rank is None:
+                rank = rank_map.get(sym_key)
+            threshold = pyramid_profit_threshold_for_rank(rank, cap)
+            row = {
+                "symbol": sym_key,
+                "rank": rank,
+                "capital_allocated": round(cap, 2),
+                "position_status": position_status,
+                "exit_reason": exit_reason,
+                "realized_pnl": realized,
+                "unrealized_pnl": round(unrealized, 2),
+                "total_pnl": total_pnl,
+                "profit_threshold": round(threshold, 2) if threshold is not None else None,
+                "is_profitable": False,
+            }
+            if is_exited:
+                print(
+                    f"[PYRAMID-PROFIT] {sym_key}: already exited "
+                    f"reason={exit_reason} realized={realized:.2f} unrealized=0.00"
+                )
+                removed.append(
+                    f"{sym_key}(status=EXITED, reason={exit_reason}, realized={realized:.2f})"
+                )
+                removed_keys.add(sym_key)
+                pnl_rows.append(row)
+                continue
+
+            if threshold is None:
+                removed.append(f"{sym_key}(rank={rank!r}, missing threshold)")
+                removed_keys.add(sym_key)
+                pnl_rows.append(row)
+                continue
+            pct = PYR_PROFIT_THRESHOLD_PCT.get(int(rank), PYR_PROFIT_THRESHOLD_PCT[10])
+            print(
+                f"[PYRAMID-PROFIT] {sym_key}: rank={rank} capital={cap:.2f} "
+                f"pct={pct}% threshold={threshold:.2f} unrealized={unrealized:.2f}"
+            )
+            row["is_profitable"] = unrealized > threshold
+            pnl_rows.append(row)
+            if unrealized > threshold:
                 profitable.append((sym_key, entry, cap, unrealized))
             else:
-                removed.append(f"{sym_key}(unrealized={unrealized:.2f})")
+                removed.append(
+                    f"{sym_key}(rank={rank}, unrealized={unrealized:.2f}, threshold={threshold:.2f})"
+                )
                 removed_keys.add(sym_key)
 
         if removed:
@@ -2497,8 +3240,17 @@ class AutoTrader:
 
         if not profitable:
             print(
-                "[PYRAMID] No symbols with unrealized_pnl > 0 — "
+                "[PYRAMID] No symbols passed rank-based profit threshold — "
                 "skipping Mongo update (master config preserved)"
+            )
+            return self._finish_pyramid_handoff(
+                self._build_pyramid_handoff_result(
+                    applied=False,
+                    live_allowed=False,
+                    reason="no_profitable_symbols",
+                    removed_symbols=[item.split("(")[0] for item in removed],
+                ),
+                pnl_rows,
             )
 
         # --- pyramid cycle-log profitability (disabled) ---
@@ -2536,12 +3288,6 @@ class AutoTrader:
         #         f"{PYRAMID_PROFIT_THRESHOLD_PCT * 100:.3f}% of allocated capital — "
         #         "skipping Mongo update (master config preserved)"
         #     )
-            return self._build_pyramid_handoff_result(
-                applied=False,
-                live_allowed=False,
-                reason="no_profitable_symbols",
-                removed_symbols=[item.split("(")[0] for item in removed],
-            )
 
         profitable_static = []
         for sym_key, entry, current_capital, unrealized in profitable:
@@ -2562,20 +3308,26 @@ class AutoTrader:
 
         if not profitable_static:
             print("[PYRAMID] No profitable symbols with valid rank — aborting update")
-            return self._build_pyramid_handoff_result(
-                applied=False,
-                live_allowed=False,
-                reason="no_profitable_with_valid_rank",
-                removed_symbols=[item.split("(")[0] for item in removed],
+            return self._finish_pyramid_handoff(
+                self._build_pyramid_handoff_result(
+                    applied=False,
+                    live_allowed=False,
+                    reason="no_profitable_with_valid_rank",
+                    removed_symbols=[item.split("(")[0] for item in removed],
+                ),
+                pnl_rows,
             )
 
         capital_after_static_sum = sum(item[5] for item in profitable_static)
         if capital_after_static_sum <= 0:
             print("[PYRAMID] Sum of capital after static multiplier <= 0 — aborting")
-            return self._build_pyramid_handoff_result(
-                applied=False,
-                live_allowed=False,
-                reason="capital_after_static_non_positive",
+            return self._finish_pyramid_handoff(
+                self._build_pyramid_handoff_result(
+                    applied=False,
+                    live_allowed=False,
+                    reason="capital_after_static_non_positive",
+                ),
+                pnl_rows,
             )
 
         dynamic_multiplier = remaining_cash / capital_after_static_sum
@@ -2585,10 +3337,13 @@ class AutoTrader:
         )
         if dynamic_multiplier <= 0:
             print(f"[PYRAMID] dynamic_multiplier <= 0 ({dynamic_multiplier:.4f}) — aborting update")
-            return self._build_pyramid_handoff_result(
-                applied=False,
-                live_allowed=False,
-                reason="dynamic_multiplier_non_positive",
+            return self._finish_pyramid_handoff(
+                self._build_pyramid_handoff_result(
+                    applied=False,
+                    live_allowed=False,
+                    reason="dynamic_multiplier_non_positive",
+                ),
+                pnl_rows,
             )
 
         updated_by_symbol = {}
@@ -2617,10 +3372,13 @@ class AutoTrader:
 
         if not updated_by_symbol:
             print("[PYRAMID] No profitable symbols with valid rank — aborting update")
-            return self._build_pyramid_handoff_result(
-                applied=False,
-                live_allowed=False,
-                reason="no_symbols_updated",
+            return self._finish_pyramid_handoff(
+                self._build_pyramid_handoff_result(
+                    applied=False,
+                    live_allowed=False,
+                    reason="no_symbols_updated",
+                ),
+                pnl_rows,
             )
 
         saved = self._persist_pyramid_merged_updates(
@@ -2634,23 +3392,29 @@ class AutoTrader:
         symbols_for_live = self._symbols_for_live_from_entries(updated_by_symbol)
         if saved:
             self._pyramid_applied = True
-            result = self._build_pyramid_handoff_result(
-                applied=True,
-                live_allowed=len(symbols_for_live) > 0,
-                reason="ok" if symbols_for_live else "no_symbols_for_live",
-                profitable_count=len(symbols_for_live),
-                symbols_for_live=symbols_for_live,
-                removed_symbols=sorted(removed_keys),
+            result = self._finish_pyramid_handoff(
+                self._build_pyramid_handoff_result(
+                    applied=True,
+                    live_allowed=len(symbols_for_live) > 0,
+                    reason="ok" if symbols_for_live else "no_symbols_for_live",
+                    profitable_count=len(symbols_for_live),
+                    symbols_for_live=symbols_for_live,
+                    removed_symbols=sorted(removed_keys),
+                ),
+                pnl_rows,
             )
             self._pyramid_handoff_result_cache = result
             return result
 
-        return self._build_pyramid_handoff_result(
-            applied=False,
-            live_allowed=len(symbols_for_live) > 0,
-            reason="mongo_save_failed",
-            profitable_count=len(symbols_for_live),
-            symbols_for_live=symbols_for_live,
+        return self._finish_pyramid_handoff(
+            self._build_pyramid_handoff_result(
+                applied=False,
+                live_allowed=False,
+                reason="mongo_save_failed",
+                profitable_count=len(symbols_for_live),
+                symbols_for_live=symbols_for_live,
+            ),
+            pnl_rows,
         )
 
     def _persist_paper_state_snapshot(self, event: str = "") -> None:
@@ -3017,112 +3781,124 @@ class AutoTrader:
 
         return closed_candle_dt.strftime("%Y-%m-%d %H:%M")
         
+    def _shared_ltp_bar(self, now):
+        """15m slot from 09:30 IST (same grid as csv15m / plugin cycles)."""
+        local = now
+        if getattr(local, "tzinfo", None) is not None:
+            local = local.replace(tzinfo=None)
+        start = datetime.combine(local.date(), dt_time(9, 30))
+        end = datetime.combine(local.date(), dt_time(15, 0))
+        if local < start:
+            return start
+        asof = local if local <= end else end
+        slot = (int((asof - start).total_seconds() // 60) // 15) * 15
+        bar = start + timedelta(minutes=slot)
+        if bar > end:
+            bar = end
+        return bar
+
+    def _parse_shared_ltp(self, cached):
+        if cached is None:
+            return None
+        try:
+            val = float(cached)
+            return val if val > 0 else None
+        except (ValueError, TypeError):
+            pass
+        try:
+            data = json.loads(cached)
+            val = float(data["price"])
+            return val if val > 0 else None
+        except Exception:
+            return None
+
     def _get_live_price_redis(self, symbol: str, candle: str) -> Optional[float]:
         """
-        Worker-independent LIVE price cache using Redis.
-        Keyed by candle boundary so it auto-refreshes every candle.
+        Shared LTP for all accounts: GET price:ltp:{SYM}.NS:{date}:{HHMM}.
+        Written by csv15m (09:30–10:15, …) and /predict append (10:30, 11:45, …) via SET NX.
+        First trader caller after a miss also SET NX; losers must not use their own fetch.
         """
-        t_ltp_sym = time.time()  #  ADD THIS LINE
-
+        t_ltp_sym = time.time()
+        redis_client = getattr(self.market_client, "redis_client", None)
+        now = self._now_market_time()
+        bar = self._shared_ltp_bar(now)
+        redis_key = (
+            f"price:ltp:{symbol}.NS:{bar.strftime('%Y-%m-%d')}:{bar.strftime('%H%M')}"
+        )
         print(
-            f"[LTP FUNC] symbol={symbol} candle={candle} "
-            f"redis={'YES' if getattr(self.market_client, 'redis_client', None) else 'NO'} "
-            f"fetch_price={'YES' if hasattr(self.market_client, 'fetch_price') else 'NO'}",
+            f"[LTP FUNC] symbol={symbol} candle={candle} key={redis_key} "
+            f"redis={'YES' if redis_client else 'NO'}",
             flush=True
         )
-
+        if redis_client is None:
+            return None
         try:
-            # Ensure redis exists
-            redis_client = getattr(self.market_client, "redis_client", None)
-            if redis_client is None:
-                return None
+            cached = redis_client.get(redis_key)
+            val = self._parse_shared_ltp(cached)
+            if val is not None:
+                print(f"[LTP SHARED] GET hit {redis_key} price={val:.4f}")
+                return val
 
-            now = self._now_market_time()
-            candle_key = self._get_candle_key(now, candle)
-
-            # redis_key_without_ns = f"price:live:{symbol}"
-            redis_key_with_ns = f"price:live:{symbol}.NS"
-            
-            # cached_without_ns = redis_client.get(redis_key_without_ns)
-            cached_with_ns = redis_client.get(redis_key_with_ns)
-
-            print(f"\n[DEBUG-VERIFY] BOTH KEYS FETCH TEST:")
-            # print(f"  --> Key '{redis_key_without_ns}'     = {cached_without_ns}")
-            print(f"  --> Key '{redis_key_with_ns}'  = {cached_with_ns}")
-
-            # redis_key = redis_key_without_ns
-            redis_key = redis_key_with_ns
-            cached = cached_with_ns
-
-            if cached:
-                try:
-                    val = float(cached)
+            for _ in range(8):
+                time.sleep(0.15)
+                cached = redis_client.get(redis_key)
+                val = self._parse_shared_ltp(cached)
+                if val is not None:
+                    print(f"[LTP SHARED] GET wait-hit {redis_key} price={val:.4f}")
                     return val
-                except (ValueError, TypeError):
-                    pass
-                try:
-                    data = json.loads(cached)
-                    val = float(data["price"])
-                    elapsed_ltp = round(time.time() - t_ltp_sym, 3)
-                    print(f"[TIMING] LTP_PER_SYMBOL {symbol:<15} {elapsed_ltp:>7.3f}s  source=REDIS_JSON")
-                    return val
-                except Exception as e:
-                    pass
 
-
-            # 2) Fetch CLOSED candle price  must match what prediction_service
-            # uses as anchor (closed candle start = floor(now-60s) to step boundary)
             if not hasattr(self.market_client, "fetch_price"):
                 return None
-
             ticker = f"{symbol}.NS"
-            step_val = 5  # Hardcoded to 5m boundaries
-            elapsed = (now.hour * 60 + now.minute) - (9 * 60 + 15)
-            if elapsed < 0:
-                elapsed = 0
-            floored_offset = (elapsed // step_val) * step_val
-            ist_tz = now.tzinfo
-            closed_candle_dt = now.replace(
-                hour=9, minute=15, second=0, microsecond=0
-            ) + timedelta(minutes=floored_offset)
-
+            bar_dt = bar
+            if now.tzinfo is not None and bar_dt.tzinfo is None:
+                bar_dt = bar_dt.replace(tzinfo=now.tzinfo)
             tlog_fetch_price_start = time.time()
-            print("calling market_client.fetch_price inside the get_live_price_redis",ticker,closed_candle_dt,candle)
+            print("calling market_client.fetch_price inside the get_live_price_redis", ticker, bar_dt, candle)
             px = self.market_client.fetch_price(
                 ticker=ticker,
-                target_datetime=closed_candle_dt,
-                candle=candle
+                target_datetime=bar_dt,
+                candle=candle,
             )
-            tlog_fetch_price_end = time.time()
-            print(f"[TIMING] LTP_PER_SYMBOL {symbol:<15} {tlog_fetch_price_end - tlog_fetch_price_start:>7.3f}s  source=BROKER_FETCH")
-            self.tlog.record("fetch_Price_total_time", tlog_fetch_price_start, note=f"fetch_price_total_time={tlog_fetch_price_end - tlog_fetch_price_start}")
-
-            if not px:
+            self.tlog.record(
+                "fetch_Price_total_time",
+                tlog_fetch_price_start,
+                note=f"fetch_price_total_time={time.time() - tlog_fetch_price_start}",
+            )
+            if not px or float(px.get("Close") or 0) <= 0:
+                cached = redis_client.get(redis_key)
+                return self._parse_shared_ltp(cached)
+            live = float(px["Close"])
+            payload = json.dumps({
+                "price": live,
+                "bar": bar.strftime("%H:%M"),
+                "source": "trader_setnx",
+            })
+            created = redis_client.set(redis_key, payload, nx=True, ex=5400)
+            print(
+                f"[LTP SHARED] SET NX {redis_key} price={live:.4f} created={bool(created)}"
+            )
+            if not created:
+                for _ in range(12):
+                    cached = redis_client.get(redis_key)
+                    val = self._parse_shared_ltp(cached)
+                    if val is not None:
+                        elapsed_ltp = round(time.time() - t_ltp_sym, 3)
+                        print(
+                            f"[LTP SHARED] winner price after SET NX lost "
+                            f"{redis_key} price={val:.4f}"
+                        )
+                        print(f"[TIMING] LTP_PER_SYMBOL {symbol:<15} {elapsed_ltp:>7.3f}s  source=SHARED_LTP")
+                        return val
+                    time.sleep(0.15)
+                print(
+                    f"[LTP SHARED] SET NX lost and GET empty — refusing local fetch "
+                    f"for {redis_key}"
+                )
                 return None
-
-            print("px is present",px)
-
-            live = px.get("Close")
-            if live is None:
-                return None
-
-            live = float(live)
-            if live <= 0:
-                return None
-
-            # 3) Cache in Redis: short TTL (safe)
-            # Since key is candle-specific, TTL is just to clean up memory.
-            # 90 sec is enough.
-            # redis_client.setex(redis_key, 90, str(live))
-
-            candle_ttl = 70 if candle == "1m" else 420   # 60s fire delay + 300s candle + buffer
-            redis_client.setex(redis_key, candle_ttl, str(live))
-
-            # return live
             elapsed_ltp = round(time.time() - t_ltp_sym, 3)
-            print(f"[TIMING] LTP_PER_SYMBOL {symbol:<15} {elapsed_ltp:>7.3f}s  source=BROKER_FETCH")
+            print(f"[TIMING] LTP_PER_SYMBOL {symbol:<15} {elapsed_ltp:>7.3f}s  source=SHARED_LTP")
             return live
-
         except Exception as e:
             print(f"[LIVE PRICE REDIS ERROR] {symbol}: {e}")
             return None
@@ -3206,6 +3982,19 @@ class AutoTrader:
             return True
         
         print(f"[INFO] Found {len(broker_positions)} position(s) to exit")
+
+        eod_exit_records = {}
+        for pos in broker_positions:
+            sym = pos["symbol"]
+            position_side = pos["side"]
+            exit_side = "SELL" if position_side == "BUY" else "BUY"
+            eod_exit_records[sym] = {
+                "symbol": sym,
+                "position_side": position_side,
+                "exit_side": exit_side,
+                "qty": pos.get("qty", 0),
+                "price": float(pos.get("ltp") or 0.0),
+            }
         
         # Collect all exit orders
         exit_orders = []
@@ -3253,6 +4042,12 @@ class AutoTrader:
                 sym = result.symbol
                 metadata = result.metadata or {}
                 original_side = metadata.get("original_side", "UNKNOWN")
+
+                if sym in eod_exit_records:
+                    if result.avg_price and float(result.avg_price) > 0:
+                        eod_exit_records[sym]["price"] = float(result.avg_price)
+                    elif metadata.get("curr_price"):
+                        eod_exit_records[sym]["price"] = float(metadata["curr_price"])
                 
                 if result.success:
                     successful_exits += 1
@@ -3304,6 +4099,11 @@ class AutoTrader:
         # Final sync
         print("\n[FINAL SYNC] Syncing with broker...")
         self._sync_cash_with_broker()
+
+        try:
+            self._persist_eod_exit_trading_logs(list(eod_exit_records.values()))
+        except Exception as e:
+            print(f"[EOD-LOG] trading_logs insert failed: {e}")
         
         # Clear internal positions
         self.positions.clear()
@@ -3326,7 +4126,7 @@ class AutoTrader:
         
         return True
 
-    def exit_single_position(self, symbol: str) -> dict:
+    def exit_single_position(self, symbol: str, exit_reason: str = "MANUAL_EXIT") -> dict:
         """
         Exit a single symbol's position.
         - Fetches broker positions for this symbol
@@ -3359,6 +4159,7 @@ class AutoTrader:
             qty = target_pos["qty"]
             curr_price = target_pos.get("ltp", 0.0)
             exit_side = "SELL" if side == "BUY" else "BUY"
+            pre_exit_position = self._snapshot_position_for_exit(symbol, target_pos)
 
             print(f"[SINGLE EXIT] {symbol}: Closing {side} position (qty={qty}) @ {curr_price:.2f}")
 
@@ -3376,6 +4177,8 @@ class AutoTrader:
                     "order_value": curr_price * qty,
                     "original_side": side,
                     "position_side": side,
+                    "pre_exit_position": pre_exit_position,
+                    "exit_reason": exit_reason,
                 }
             )
 
@@ -3391,17 +4194,44 @@ class AutoTrader:
             metadata = result.metadata or {}
 
             if result.success:
+                exit_ctx = {
+                    "order_id": result.order_id,
+                    "action_type": metadata.get("action_type", "EXIT_LONG"),
+                    "side": metadata.get("side"),
+                    "qty": metadata.get("qty"),
+                    "order_value": metadata.get("order_value", 0.0),
+                    "position_side": metadata.get("position_side"),
+                    "pre_exit_position": metadata.get("pre_exit_position") or pre_exit_position,
+                    "exit_reason": metadata.get("exit_reason") or exit_reason,
+                    "placed_at": time.time(),
+                }
+
+                if result.filled and float(result.avg_price or 0.0) > 0:
+                    self._finalize_symbol_exit_fill(
+                        symbol,
+                        {
+                            "side": metadata.get("side"),
+                            "qty": int(result.filled_qty or metadata.get("qty") or 0),
+                            "avg_price": float(result.avg_price or 0.0),
+                        },
+                        exit_ctx,
+                    )
+                    msg = f"Exit order filled for {symbol} (closed {side} position, qty={qty})"
+                    print(f"[SINGLE EXIT] {msg}")
+                    return {"success": True, "symbol": symbol, "message": msg, "order_id": result.order_id}
+
                 # Add to pending for reconciliation
                 with self.pending_lock:
-                    self.pending_orders[symbol].append({
-                        "order_id": result.order_id,
-                        "action_type": metadata.get("action_type", "EXIT_LONG"),
-                        "side": metadata.get("side"),
-                        "qty": metadata.get("qty"),
-                        "order_value": metadata.get("order_value", 0.0),
-                        "position_side": metadata.get("position_side"),
-                        "placed_at": time.time(),
-                    })
+                    self.pending_orders[symbol].append(exit_ctx)
+
+                self._persist_exit_pending(
+                    symbol,
+                    exit_reason=exit_ctx["exit_reason"],
+                    exit_side=exit_ctx["side"],
+                    qty=exit_ctx["qty"],
+                    entry_price=pre_exit_position.get("entry_price", 0.0),
+                    exit_order_id=result.order_id,
+                )
 
                 # Mark symbol as exited Ã¢â‚¬â€ will be excluded from next trading cycle
                 self._exited_symbols.add(symbol)
@@ -3794,6 +4624,49 @@ class AutoTrader:
         except Exception as e:
             print(f"[DB ERROR] Trading snapshot insert failed: {e}")
 
+    def _persist_eod_exit_trading_logs(self, exit_records: list) -> None:
+        """Save 15:00 / shutdown square-off rows to trading_logs for the frontend."""
+        if not exit_records:
+            return
+        session_id = getattr(self, "ui_session_id", None) or getattr(self, "session_id", None)
+        if not session_id:
+            print("[EOD-LOG] No session_id — skipping trading_logs insert")
+            return
+
+        rows = []
+        for rec in exit_records:
+            sym = rec["symbol"]
+            exit_side = rec["exit_side"]
+            position_side = rec["position_side"]
+            qty = int(rec.get("qty") or 0)
+            price = float(rec.get("price") or 0.0)
+            symbol_realized = round(float(self.realized_pnl_by_symbol.get(sym, 0.0)), 2)
+            rows.append({
+                "symbol": sym,
+                "curr_price": round(price, 2),
+                "return_pct": 0.0,
+                "side": position_side,
+                "signal": "",
+                "action": exit_side,
+                "qty": qty,
+                "unrealized_pnl": 0.0,
+                "symbol_unrealized_pnl": 0.0,
+                "symbol_realized_pnl": symbol_realized,
+                "symbol_pnl": symbol_realized,
+                "pnl": symbol_realized,
+            })
+
+        self.current_cycle_ts_str = self._now_market_time().strftime("%Y-%m-%d %H:%M:%S")
+        self.unrealized_pnl = 0.0
+        cycle = (
+            getattr(self, "_current_cycle_count", None)
+            or getattr(self, "_cycle_count", None)
+            or 0
+        )
+        cycle = int(cycle) + 1
+        print(f"[EOD-LOG] Persisting {len(rows)} square-off row(s) to trading_logs (cycle={cycle})")
+        self._update_ui_snapshot(session_id, cycle, rows)
+
     def _sync_cash_with_broker(self):
         print("[SYNC] Syncing cash balance with broker...")
         free_cash = self._get_free_cash()
@@ -3829,16 +4702,14 @@ class AutoTrader:
             print(
                 f"[LIVE RESULT] {symbol} "
                 f"live_price={live_price} "
-                f"({'FALLBACK predicted[0]' if live_price is None else 'USING LIVE'})",
+                f"({'FALLBACK predicted[0]' if live_price is None else 'USING SHARED LTP'})",
                 flush=True
             )
             
-            # fallback to predicted first point if live fetch fails
             current_price = float(live_price) if live_price else float(predicted_path[0])
             
             if live_price is None:
-                print(f"\n[DEBUG-VERIFY] {symbol}: `live_price` is missing entirely! Falling back to static predicted_path[0]: {current_price}")
-                print(f"[DEBUG-VERIFY] This fallback price is why the UI stays stagnant all day.")
+                print(f"\n[DEBUG-VERIFY] {symbol}: shared LTP missing — using predicted_path[0]: {current_price}")
 
             print(
                 f"[CURR PRICE FINAL] {symbol} curr_price={current_price}",
@@ -3848,7 +4719,7 @@ class AutoTrader:
             # -------------------------------
             traj_col = group["trajectory_pct"].values if "trajectory_pct" in group.columns else None
             regime_col = group["risk_regime"].values if "risk_regime" in group.columns else None
-
+            
             if traj_col is not None and len(traj_col) > 0 and not np.isnan(traj_col[0]):
                 # Use slot 0's trajectory ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the most current signal
                 trajectory_pct = float(traj_col[0])
@@ -4015,12 +4886,15 @@ class AutoTrader:
 
         return 300
 
-    def _close_position(self, session, symbol, exit_price, exit_qty):
+    def _close_position(self, session, symbol, exit_price, exit_qty, position_snapshot: Optional[dict] = None):
         # -------------------------------
         # Atomic fetch and update (thread-safe)
         # -------------------------------
         with self.positions_lock:
             pos = self.positions.get(symbol)
+            position_was_live = bool(pos)
+            if not pos and position_snapshot:
+                pos = dict(position_snapshot)
             if not pos:
                 return 0.0
 
@@ -4054,14 +4928,14 @@ class AutoTrader:
             # Handle partial exits cleanly and position flips
             remaining_qty = exit_qty - current_qty
             
-            if remaining_qty > 0:
+            if position_was_live and remaining_qty > 0:
                 pos["side"] = "SELL" if side == "BUY" else "BUY"
                 pos["qty"] = remaining_qty
                 pos["entry_price"] = exit_price
                 print(f"[POSITION FLIP] {symbol}: Flipped to {pos['side']} {remaining_qty} @ {exit_price}")
-            elif remaining_qty == 0:
+            elif position_was_live and remaining_qty == 0:
                 self.positions.pop(symbol, None)
-            else:
+            elif position_was_live:
                 pos["qty"] -= exit_qty
 
         # -------------------------------
@@ -4078,6 +4952,7 @@ class AutoTrader:
         # exit all stocks. Per-ticker RMS remains active.
         # self._check_realized_portfolio_rms()
 
+        self._persist_paper_state_snapshot(event=f"pnl_close:{symbol}")
         return profit
 
     def _is_position_settled(self, broker_pos):
@@ -4276,6 +5151,14 @@ class AutoTrader:
         print(f"Broker free cash / available margin: {free_cash:,.2f}")
         self.alerts.notify(f"Broker free cash / available margin: {free_cash:,.2f}")
 
+        if PYRAMID_FREE_CASH_OVERRIDE is not None:
+            capped = min(float(free_cash), float(PYRAMID_FREE_CASH_OVERRIDE))
+            print(
+                f"[TEST-CASH-CAP] using {capped:,.2f} as free cash "
+                f"(broker={float(free_cash):,.2f}, cap={PYRAMID_FREE_CASH_OVERRIDE:,.2f})"
+            )
+            free_cash = capped
+
         if use_broker_cash_as_capital:
             self.initial_capital = free_cash
             self.current_capital = free_cash
@@ -4304,6 +5187,17 @@ class AutoTrader:
                 }
                 for sym, alloc in initial_allocations.items()
             }
+            if PYRAMID_FREE_CASH_OVERRIDE is not None:
+                total_alloc = sum(float(a.get("capital") or 0) for a in self.symbol_allocations.values())
+                cap = float(PYRAMID_FREE_CASH_OVERRIDE)
+                if total_alloc > cap > 0:
+                    scale = cap / total_alloc
+                    for sym, alloc in self.symbol_allocations.items():
+                        alloc["capital"] = round(float(alloc["capital"]) * scale, 2)
+                    print(
+                        f"[TEST-CASH-CAP] scaled symbol allocations "
+                        f"{total_alloc:,.2f} -> {cap:,.2f} (x{scale:.4f})"
+                    )
 
         # RMS loss limit based on total capital allocated across all symbols
         total_allocated = sum(a["capital"] for a in self.symbol_allocations.values()) if self.symbol_allocations else self.initial_capital
@@ -4350,9 +5244,13 @@ class AutoTrader:
 
                 # ==================== FILTER EXITED SYMBOLS ====================
                 # If any symbols were manually exited, remove them from the active list
+                self._sync_exited_symbols_from_db()
                 if self._exited_symbols:
                     before_count = len(symbols)
-                    symbols = [s for s in symbols if s not in self._exited_symbols]
+                    symbols = [
+                        s for s in symbols
+                        if self._normalize_config_symbol(s) not in self._exited_symbols
+                    ]
                     symbol_batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)]
                     removed = self._exited_symbols.copy()
                     # Don't clear _exited_symbols Ã¢â‚¬â€ keep them excluded permanently
@@ -4400,6 +5298,10 @@ class AutoTrader:
                     print(f"[SKIP] Candle {candle_key} already executed")
                     self._sleep_until_next_candle(candle)
                     continue
+
+                if self.stop_event.is_set():
+                    print(f"[SKIP] Stop requested — skipping candle {candle_key}")
+                    break
 
                 #  LOCK CANDLE IMMEDIATELY (IMPORTANT)
                 self._last_executed_candle = candle_key
@@ -4607,6 +5509,11 @@ class AutoTrader:
                     self.positions,
                     session_trends=session_trends
                 )
+                self._cycle_ltp_cache = {
+                    sym: float(info["curr_price"])
+                    for sym, info in signals.items()
+                    if info.get("curr_price")
+                }
                 self.tlog.record("ANALYZE_SIGNALS", t_analyze, note=f"symbols={len(signals)}")
 
                 market_now = self._now_market_time()
@@ -4622,6 +5529,7 @@ class AutoTrader:
 
                 session_id = getattr(self, "ui_session_id", "default")
                 ui_rows = []
+                cycle_orders_sent = set()
 
                 # ========== PARALLEL ORDER EXECUTION - PHASE 1: COLLECT ORDERS ==========
                 order_batcher = OrderBatcher()
@@ -4736,7 +5644,10 @@ class AutoTrader:
                                                 "curr_price": curr_price,
                                                 "side": exit_side,
                                                 "qty": qty,
-                                                "order_value": curr_price * qty
+                                                "order_value": curr_price * qty,
+                                                "position_side": position_side,
+                                                "pre_exit_position": self._snapshot_position_for_exit(sym, broker_pos),
+                                                "exit_reason": "STOP_LOSS_EXIT",
                                             }
                                         ),
                                         "exit"
@@ -4753,6 +5664,7 @@ class AutoTrader:
                                         "side": "NONE",
                                         "signal": "STOP-LOSS",
                                         "action": action_taken,
+                                        "qty": qty,
                                         "unrealized_pnl": symbol_unrealized_pnl,
                                         "symbol_unrealized_pnl": symbol_unrealized_pnl,
                                         "symbol_realized_pnl": symbol_realized_pnl,
@@ -5102,7 +6014,7 @@ class AutoTrader:
                     # ========== PHASE 3: PROCESS RESULTS ==========
                     for result in results:
                         t_result = time.time()
-                        sym = result.symbol
+                        sym = result.symbol.upper().replace("-EQ", "")
                         metadata = result.metadata or {}
                         requested_value = metadata.get("order_value", 0.0)
             
@@ -5112,15 +6024,28 @@ class AutoTrader:
                         curr_price = metadata.get("curr_price", 0.0)
                         
                         if result.success and result.filled:
+                            cycle_orders_sent.add(sym)
                             avg_price = result.avg_price
                             filled_qty = result.filled_qty
                             pnl = 0.0
                             action_taken = ""
                             
                             if action_type == "EXIT_LONG":
-                                pnl = self._close_position(self.session, sym, avg_price, filled_qty)
+                                exit_doc = self._finalize_symbol_exit_fill(
+                                    sym,
+                                    {
+                                        "side": metadata.get("side"),
+                                        "qty": filled_qty,
+                                        "avg_price": avg_price,
+                                    },
+                                    {
+                                        **metadata,
+                                        "order_id": result.order_id,
+                                        "qty": filled_qty,
+                                    },
+                                )
+                                pnl = float(exit_doc.get("realized_pnl") or 0.0)
                                 action_taken = f"CLOSED LONG ({filled_qty}) {avg_price:.2f} | P&L:{pnl:,.2f}"
-                                self._log_trade(sym, "CLOSE_LONG", change_pct, "filled", avg_price, filled_qty, pnl)
                             
                             elif action_type == "OPEN_SHORT":
                                 action_taken = f"OPEN SHORT ORDER SENT ({filled_qty})"
@@ -5135,9 +6060,38 @@ class AutoTrader:
                                 )
                             
                             elif action_type in ["COVER_SHORT"]:
-                                pnl = self._close_position(self.session, sym, avg_price, filled_qty)
+                                exit_doc = self._finalize_symbol_exit_fill(
+                                    sym,
+                                    {
+                                        "side": metadata.get("side"),
+                                        "qty": filled_qty,
+                                        "avg_price": avg_price,
+                                    },
+                                    {
+                                        **metadata,
+                                        "order_id": result.order_id,
+                                        "qty": filled_qty,
+                                    },
+                                )
+                                pnl = float(exit_doc.get("realized_pnl") or 0.0)
                                 action_taken = f"COVERED SHORT ({filled_qty}) @ {avg_price:.2f} | P&L: {pnl:,.2f}"
-                                self._log_trade(sym, "CLOSE_SHORT", change_pct, "filled", avg_price, filled_qty, pnl)
+                            
+                            elif action_type == "STOP_LOSS":
+                                exit_doc = self._finalize_symbol_exit_fill(
+                                    sym,
+                                    {
+                                        "side": metadata.get("side"),
+                                        "qty": filled_qty,
+                                        "avg_price": avg_price,
+                                    },
+                                    {
+                                        **metadata,
+                                        "order_id": result.order_id,
+                                        "qty": filled_qty,
+                                    },
+                                )
+                                pnl = float(exit_doc.get("realized_pnl") or 0.0)
+                                action_taken = f"STOP LOSS EXITED ({filled_qty}) @ {avg_price:.2f} | P&L: {pnl:,.2f}"
                             
                             elif action_type == "OPEN_LONG":
                                 action_taken = f"OPEN LONG ORDER SENT ({filled_qty})"
@@ -5150,7 +6104,34 @@ class AutoTrader:
                                     filled_qty,
                                     0.0
                                 )
-                                                          
+
+                            elif action_type in ("FLIP_TO_LONG", "FLIP_TO_SHORT"):
+                                flip_qty = max(int(filled_qty) // 2, 0)
+                                action_taken = (
+                                    f"FLIPPED to {'LONG' if 'LONG' in action_type else 'SHORT'} "
+                                    f"({flip_qty}) @ {avg_price:.2f}"
+                                )
+                                self._log_trade(
+                                    sym,
+                                    action_type,
+                                    change_pct,
+                                    "filled",
+                                    avg_price,
+                                    flip_qty,
+                                    0.0,
+                                )
+
+                            order_value = metadata.get("order_value", 0.0)
+                            if order_value:
+                                try:
+                                    self._release_exposure(sym, order_value)
+                                except Exception as _re:
+                                    print(f"[FILL] {sym}: release_exposure failed: {_re}")
+
+                            # Paper fills are instant — treat as settled for this cycle's UI row.
+                            # if getattr(self, "simulation_logs", False):
+                            #     cycle_orders_sent.discard(sym)
+
                         else:
                             # Order failed at Angel before getting an order_id
                             # (validation rejects like AB1019 / AB4036, RMS rejects, etc).
@@ -5191,9 +6172,23 @@ class AutoTrader:
                                     "side": metadata.get("side"),
                                     "qty": metadata.get("qty"),
                                     "order_value": metadata.get("order_value", 0.0),
+                                    "position_side": metadata.get("position_side"),
+                                    "pre_exit_position": metadata.get("pre_exit_position"),
+                                    "exit_reason": metadata.get("exit_reason"),
                                     "placed_at": time.time(),
                                     # "metadata": metadata   # redundant
                                 })
+                            if action_type in {"EXIT_LONG", "COVER_SHORT", "STOP_LOSS"}:
+                                pre_exit = metadata.get("pre_exit_position") or self._snapshot_position_for_exit(sym)
+                                self._persist_exit_pending(
+                                    sym,
+                                    exit_reason=self._resolve_exit_reason(action_type, metadata),
+                                    exit_side=metadata.get("side"),
+                                    qty=metadata.get("qty"),
+                                    entry_price=pre_exit.get("entry_price", 0.0),
+                                    exit_order_id=result.order_id,
+                                )
+                            cycle_orders_sent.add(sym)
 
                             # Log with live redis price instead of 0.0
                             t_ltp = time.time()
@@ -5229,6 +6224,10 @@ class AutoTrader:
                 with self.pending_lock:
                     pending_syms = set(self.pending_orders.keys())
 
+                # Paper fills are synchronous — refresh positions before hold/UI snapshot.
+                with self.broker_pos_lock:
+                    self._broker_positions_cache = self._get_broker_positions()
+                    broker_positions = list(self._broker_positions_cache)
 
                 # ========== CONTINUE WITH HOLD POSITIONS ==========
                 for sym, info in signals.items(): 
@@ -5264,23 +6263,37 @@ class AutoTrader:
 
                     self.tlog.record("PNL_CALC", t_pnl, note=sym)
                     held_qty = broker_pos.get("qty", 0) if has_broker_pos else 0
+                    row_qty = int(held_qty or 0)
+                    if row_qty <= 0 and (sym in pending_syms or sym in cycle_orders_sent):
+                        row_qty = int(self._get_symbol_position_qty(sym) or 0)
+                        if row_qty <= 0:
+                            with self.pending_lock:
+                                row_qty = sum(
+                                    int(ctx.get("qty") or 0)
+                                    for ctx in self.pending_orders.get(sym, [])
+                                )
 
                     # SCENARIO 8 : WAIT NO POSITION
-                    if not has_broker_pos and sym not in pending_syms and self._stock_exposure(sym) == 0:
+                    if (
+                        not has_broker_pos
+                        and sym not in pending_syms
+                        and sym not in cycle_orders_sent
+                        and self._stock_exposure(sym) == 0
+                    ):
                         action_taken = "WAIT (no position)"
                         self._log_trade(sym, sig, change_pct, "wait", curr_price, 0, 0.0)
                     
-                    # SCENARIO 9 : PENDING STATUS
-                    elif sym in pending_syms:
+                    # SCENARIO 9 : PENDING STATUS (order sent this cycle or awaiting reconcile)
+                    elif sym in pending_syms or sym in cycle_orders_sent:
                         action_taken = "PENDING (order sent)"
-                        self._log_trade(sym, sig, change_pct, "pending", curr_price, held_qty, live_pnl)
+                        self._log_trade(sym, sig, change_pct, "pending", curr_price, row_qty, live_pnl)
 
                     #  SCENARIO 10 : HOLD WITH OPEN POSITION  log with live PnL
                     elif has_broker_pos:
                         # self._log_trade(sym, sig, change_pct, "hold", curr_price, held_qty, live_pnl)
                         t_log = time.time()
 
-                        self._log_trade(sym, sig, change_pct, "hold", curr_price, held_qty, live_pnl)
+                        self._log_trade(sym, sig, change_pct, "hold", curr_price, row_qty, live_pnl)
 
                         log_time = time.time() - t_log
 
@@ -5299,6 +6312,7 @@ class AutoTrader:
                         "side": side,
                         "signal": sig,
                         "action": action_taken,
+                        "qty": row_qty,
                         "unrealized_pnl": symbol_unrealized_pnl,
                         "symbol_unrealized_pnl": symbol_unrealized_pnl,
                         "symbol_realized_pnl": symbol_realized_pnl,
@@ -5441,6 +6455,7 @@ class AutoTrader:
         if getattr(self, "_shutdown_done", False):
             return
         self._shutdown_done = True
+        self.stop_event.set()
         if getattr(self, "simulation_logs", False):
             print("[SHUTDOWN] Paper stop — applying capital pyramid update (no square-off)...")
             try:
@@ -5455,7 +6470,7 @@ class AutoTrader:
                 traceback.print_exc()
                 self._pyramid_handoff_result = self._build_pyramid_handoff_result(
                     applied=False,
-                    live_allowed=True,
+                    live_allowed=False,
                     reason="pyramid_exception",
                 )
         elif getattr(self, "_auto_exit_done", False):
@@ -5477,7 +6492,6 @@ class AutoTrader:
                 self._csv_logger.stop()
             except Exception as e:
                 print(f"[SHUTDOWN] AsyncCsvLogger stop failed: {e}")
-        self.stop_event.set()
 
 
         
