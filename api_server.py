@@ -1201,6 +1201,7 @@ async def fetch_session_from_db(session_id: str) -> Optional[Dict[str, Any]]:
             "refresh_token": _decrypt_val(bs.get("refresh_token")),
             "feed_token": _decrypt_val(bs.get("feed_token")),
             "broadcast_token": _decrypt_val(bs.get("broadcast_token")),
+            "broadcast_socket": bs.get("broadcast_socket"),
         }
         restored["broker_session"] = {k: v for k, v in restored_bs.items() if v is not None}
 
@@ -1252,6 +1253,7 @@ def _session_metadata_payload(session_id: str) -> Dict[str, Any]:
             "refresh_token": _encrypt_val(bs.get("refresh_token") or bs.get("refreshToken")),
             "feed_token": _encrypt_val(bs.get("feed_token") or bs.get("feedToken")),
             "broadcast_token": _encrypt_val(bs.get("broadcast_token")),
+            "broadcast_socket": bs.get("broadcast_socket"),
         }
 
     payload: Dict[str, Any] = {
@@ -1818,6 +1820,8 @@ async def authenticate_credentials(credentials: BrokerCredentials , request:Requ
                         "token": _encrypt_val(broker_session.get("token")),
                         "refresh_token": _encrypt_val(broker_session.get("refresh_token")),
                         "feed_token": _encrypt_val(broker_session.get("feed_token")),
+                        "broadcast_token": _encrypt_val(broker_session.get("broadcast_token")),
+                        "broadcast_socket": broker_session.get("broadcast_socket"),
                     }
                 }
             )
@@ -1951,6 +1955,8 @@ async def authenticate_totp(totp_req: TOTPRequest , x_plugin_api_key: str = Head
                     "token": _encrypt_val(broker_session.get("token")),
                     "refresh_token": _encrypt_val(broker_session.get("refresh_token")),
                     "feed_token": _encrypt_val(broker_session.get("feed_token")),
+                    "broadcast_token": _encrypt_val(broker_session.get("broadcast_token")),
+                    "broadcast_socket": broker_session.get("broadcast_socket"),
                 }
             }
         )
@@ -2093,15 +2099,41 @@ async def start_trading(config: TradingConfig ,x_plugin_api_key: str = Header(No
             has_broker_session=bool(session_data and session_data.get("broker_session")),
         )
 
+    print("PID:", os.getpid(), "session_id:", session_id)
+    print(
+        "PID:", os.getpid(),
+        "Thread:", threading.current_thread().name,
+        "sessions_store_keys:", list(sessions_store.keys())
+    )
+
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id missing")
+
+    # Use the robust getter to handle cross-worker synchronization
+    print(f"[START-TRADING-DEBUG] Retrieved session_data: {session_data.keys() if session_data else 'None'}")
+    if session_data:
+        print(f"[START-TRADING-DEBUG] Session Status: {session_data.get('status')}")
+
+    if not session_data:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+
+    if session_data.get("status") != "authenticated":
+        print(f"[START-TRADING-DEBUG] 401 Triggered! Status is {session_data.get('status')}")
+        raise HTTPException(
+            status_code=401,
+            detail=f"Session not authenticated. Current status: {session_data.get('status')}"
+        )
+
     symbols_payload = [
-    {
-        "symbol": s.symbol,
-        "capital": float(s.capital),
-        "stop_loss": float(s.stop_loss)
-    }
-    for s in config.symbols
+        {
+            "symbol": s.symbol,
+            "capital": float(s.capital),
+            "stop_loss": float(s.stop_loss)
+        }
+        for s in config.symbols
     ]
 
+    sessions_store.setdefault(session_id, session_data)
     sessions_store[session_id]["strategy"] = config.strategy
     sessions_store[session_id]["symbols"] = symbols_payload
     if config.configuration_id:
@@ -2120,32 +2152,6 @@ async def start_trading(config: TradingConfig ,x_plugin_api_key: str = Header(No
     if config.leverage_multiplier is not None:
         early_persist["leverage_multiplier"] = float(config.leverage_multiplier)
     persist_session_metadata_sync(session_id, early_persist)
-
-
-    print("PID:", os.getpid(), "session_id:", session_id)
-    print(
-        "PID:", os.getpid(),
-        "Thread:", threading.current_thread().name,
-        "sessions_store_keys:", list(sessions_store.keys())
-    )
-
-    if not session_id:
-        raise HTTPException(status_code=400, detail="session_id missing")
-
-    # Use the robust getter to handle cross-worker synchronization
-    print(f"[START-TRADING-DEBUG] Retrieved session_data: {session_data.keys() if session_data else 'None'}")
-    if session_data:
-        print(f"[START-TRADING-DEBUG] Session Status: {session_data.get('status')}")
-
-    if not session_data:
-        raise HTTPException(status_code=404, detail="Session not found or expired")
-    
-    if session_data.get("status") != "authenticated":
-        print(f"[START-TRADING-DEBUG] 401 Triggered! Status is {session_data.get('status')}")
-        raise HTTPException(
-            status_code=401,
-            detail=f"Session not authenticated. Current status: {session_data.get('status')}"
-        )
 
     
     try:
@@ -2368,8 +2374,21 @@ async def start_trading(config: TradingConfig ,x_plugin_api_key: str = Header(No
         worker_started_perf = time.perf_counter()
         is_live_start = not is_simulation_start
         if is_live_start:
-            cleared = SessionManager.ensure_worker_stopped(session_id, timeout=90)
-            if not cleared:
+            prep = SessionManager.prepare_for_live_start(session_id, timeout=90)
+            if prep == SessionManager.LiveStartPrepResult.LIVE_ALREADY_RUNNING:
+                print(
+                    f"[START-TRADING-DEBUG] Live start idempotent — worker already running for {session_id}"
+                )
+                return {
+                    "success": True,
+                    "message": "Trading already active on plugin",
+                    "session_id": session_id,
+                    "total_allocated": total_allocated,
+                    "free_cash": free_cash,
+                    "symbols": [s.symbol for s in config.symbols],
+                    "already_running": True,
+                }
+            if prep == SessionManager.LiveStartPrepResult.NOT_CLEARED:
                 raise HTTPException(
                     status_code=503,
                     detail=(
@@ -2392,20 +2411,26 @@ async def start_trading(config: TradingConfig ,x_plugin_api_key: str = Header(No
             if "already running" in err_text.lower():
                 worker_status = SessionManager.get_session_status(session_id)
                 if is_live_start:
-                    print(
-                        f"[START-TRADING-DEBUG] Live start blocked by stale worker for {session_id} "
-                        "- forcing cleanup and retrying once"
-                    )
-                    if SessionManager.ensure_worker_stopped(session_id, timeout=30):
-                        _spawn_worker()
-                    else:
-                        raise HTTPException(
-                            status_code=503,
-                            detail=(
-                                "Could not replace the previous worker for live trading. "
-                                "Retry in a few seconds."
-                            ),
+                    if worker_status and worker_status.get("is_alive"):
+                        print(
+                            f"[START-TRADING-DEBUG] Live start idempotent — worker alive for {session_id}"
                         )
+                        return {
+                            "success": True,
+                            "message": "Trading already active on plugin",
+                            "session_id": session_id,
+                            "total_allocated": total_allocated,
+                            "free_cash": free_cash,
+                            "symbols": [s.symbol for s in config.symbols],
+                            "already_running": True,
+                        }
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Could not start live trading — worker registry conflict. "
+                            "Retry in a few seconds."
+                        ),
+                    )
                 elif worker_status and worker_status.get("is_alive"):
                     return {
                         "success": True,

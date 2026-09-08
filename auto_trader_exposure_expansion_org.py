@@ -506,6 +506,10 @@ class AutoTrader:
         self.cash_balance = initial_capital
         self.get_access_token = get_access_token
         self.trading_logs_collection = trading_logs_collection
+        self.config_db_name = os.environ.get("MONGO_CONFIG_DB_NAME", "test")
+        self.configuration_id = None
+        self.leverage_multiplier = None
+        self.simulation_logs = False
         self.max_exposure_pct = 1.00
         self.reserved_exposure = {}  
         self.symbol_locks = {}        
@@ -1566,6 +1570,115 @@ class AutoTrader:
     def _reserved_exposure(self, symbol):
         return self.reserved_exposure.get(symbol, 0.0)
 
+    @staticmethod
+    def _coerce_leverage_multiplier(value, source: str = "") -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            mult = float(value)
+            if mult > 0:
+                return mult
+            print(f"[LEVERAGE] Ignoring non-positive {source}: {value!r}")
+        except (TypeError, ValueError):
+            print(f"[LEVERAGE] Invalid {source}: {value!r}")
+        return None
+
+    def _normalize_configuration_root(self, config_doc: dict) -> dict:
+        root = config_doc.get("configuration", config_doc)
+        if isinstance(root, str):
+            try:
+                root = json.loads(root)
+            except Exception as exc:
+                print(f"[LEVERAGE] configuration JSON parse failed: {exc}")
+                return {}
+        if not isinstance(root, dict):
+            return {}
+        return root
+
+    def _leverage_from_config_doc(self, config_doc: dict) -> Optional[float]:
+        if not isinstance(config_doc, dict):
+            return None
+        for key in ("leverage_multiplier", "leverage", "pyramid_leverage_multiplier"):
+            val = self._coerce_leverage_multiplier(
+                config_doc.get(key), f"SavedTradingConfiguration.{key}"
+            )
+            if val is not None:
+                return val
+        root = self._normalize_configuration_root(config_doc)
+        for key in ("leverage_multiplier", "leverage", "pyramid_leverage_multiplier"):
+            val = self._coerce_leverage_multiplier(root.get(key), f"configuration.{key}")
+            if val is not None:
+                return val
+        return None
+
+    def _fetch_saved_trading_configuration_for_leverage(self) -> Optional[dict]:
+        configuration_id = getattr(self, "configuration_id", None)
+        coll = self.trading_logs_collection
+        if not configuration_id or coll is None:
+            return None
+
+        config_db_name = getattr(self, "config_db_name", None) or os.environ.get(
+            "MONGO_CONFIG_DB_NAME", "test"
+        )
+        collection_names = (
+            "savedtradingconfigurations",
+            "SavedTradingConfiguration",
+        )
+        mongo_client = coll.database.client
+        config_db = mongo_client[config_db_name]
+
+        queries = [{"configuration_id": configuration_id}]
+        try:
+            from bson import ObjectId
+
+            if ObjectId.is_valid(configuration_id):
+                oid = ObjectId(configuration_id)
+                queries.insert(0, {"_id": oid})
+                queries.append({"configuration_id": str(oid)})
+        except Exception:
+            pass
+
+        for coll_name in collection_names:
+            if coll_name not in config_db.list_collection_names():
+                continue
+            config_coll = config_db[coll_name]
+            for query in queries:
+                try:
+                    doc = config_coll.find_one(query)
+                except Exception as exc:
+                    print(f"[LEVERAGE] SavedTradingConfiguration lookup failed: {exc}")
+                    continue
+                if doc:
+                    return doc
+        return None
+
+    def _resolve_leverage_multiplier(self, config_doc=None, default: float = 4.0) -> float:
+        """
+        Resolve intraday leverage: session/request -> SavedTradingConfiguration -> default.
+        Live exposure cap defaults to 4.0 (legacy behavior) when unset.
+        """
+        val = self._coerce_leverage_multiplier(
+            getattr(self, "leverage_multiplier", None), "session"
+        )
+        if val is not None:
+            self.leverage_multiplier = val
+            return val
+
+        doc = config_doc
+        if doc is None:
+            doc = self._fetch_saved_trading_configuration_for_leverage()
+
+        if doc:
+            val = self._leverage_from_config_doc(doc)
+            if val is not None:
+                self.leverage_multiplier = val
+                print(f"[LEVERAGE] Using leverage_multiplier={val} from SavedTradingConfiguration")
+                return val
+
+        self.leverage_multiplier = float(default)
+        print(f"[LEVERAGE] Falling back to leverage_multiplier={default}")
+        return float(default)
+
     # ---------- TOTAL SYMBOL EXPOSURE (FILLED + RESERVED) -------------
     
     def _total_symbol_exposure(self, symbol):
@@ -1575,8 +1688,10 @@ class AutoTrader:
 
     def _can_reserve_exposure(self, symbol, order_value):
         t0 = time.time()
+        leverage_mult = self._resolve_leverage_multiplier(default=4.0)
+        leveraged_capital = leverage_mult * self.initial_capital
 
-        result = (self._total_symbol_exposure(symbol) + order_value) <= (self.max_exposure_pct * self.initial_capital)
+        result = (self._total_symbol_exposure(symbol) + order_value) <= (self.max_exposure_pct * leveraged_capital)
         if result and PYRAMID_FREE_CASH_OVERRIDE is not None:
             keys = set(self.reserved_exposure or {})
             keys.update((self.positions or {}).keys())
@@ -3487,8 +3602,15 @@ class AutoTrader:
     def start(self, symbols, time_frame="5 minutes", candle_for_client=None,
               parameters=["close"], user_positions=None, initial_allocations = None,
               min_required_cash=0.0, stop_on_insufficient=True,
-              use_broker_cash_as_capital=True):
-        
+              use_broker_cash_as_capital=True, leverage_multiplier=None):
+
+        if leverage_multiplier is not None:
+            coerced = self._coerce_leverage_multiplier(leverage_multiplier, "start_kwarg")
+            if coerced is not None:
+                self.leverage_multiplier = coerced
+        resolved_leverage = self._resolve_leverage_multiplier(default=4.0)
+        print(f"[LEVERAGE] Active session leverage multiplier: x{resolved_leverage}")
+
         # ==================== CANDLE NORMALIZATION ====================
         candle = (candle_for_client or "5m").lower().strip()
 

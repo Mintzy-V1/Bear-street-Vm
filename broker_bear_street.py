@@ -122,8 +122,10 @@ class BrokerConnector:
         if token.startswith("Bearer "):
             token = token.replace("Bearer ", "", 1)
         self.obj = self._build_client()
+        self.broadcast_access_token = (broker_session or {}).get("broadcast_token")
         if token:
             self.obj.set_access_token(token)
+            self.obj.broadcast_token = self.broadcast_access_token
             self.access_token = token
         else:
             return self._create_session()
