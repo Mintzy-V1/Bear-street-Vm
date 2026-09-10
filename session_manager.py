@@ -23,6 +23,8 @@ from broker_factory import (
     BROKER_BEAR_STREET,
 )
 import signal
+from utils.redis_keys import session_cleanup_keys
+from utils.eod_exit import log_eod_config
 
 SIMULATION_STOP_PREFIX = "autotrader:simulation_stop:"
 # Must outlive the whole shutdown sequence (trader join + shutdown + square-off).
@@ -225,6 +227,7 @@ def _trader_worker(
         trader.initial_allocations = allocations
         trader.configuration_id = configuration_id
         trader.simulation_logs = bool(simulation_logs)
+        log_eod_config()
         if leverage_multiplier is not None:
             try:
                 trader.leverage_multiplier = float(leverage_multiplier)
@@ -705,10 +708,7 @@ class SessionManager:
             redis_client = cls._redis()
             if not redis_client:
                 return
-            redis_client.delete(
-                f"{cls.REDIS_KEY_PREFIX}{session_id}",
-                cls._session_meta_key(session_id),
-            )
+            redis_client.delete(*session_cleanup_keys(session_id))
         except Exception as e:
             print(f"[SessionManager] Redis delete failed for {session_id}: {e}")
 
