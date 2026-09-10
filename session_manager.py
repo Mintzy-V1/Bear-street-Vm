@@ -1210,10 +1210,16 @@ class SessionManager:
         try:
             pid_key = f"{cls.REDIS_KEY_PREFIX}{session_id}"
             meta_key = cls._session_meta_key(session_id)
+            meta_symbols = [
+                (s or "").upper().replace("-EQ", "").strip()
+                for s in symbols
+                if s
+            ]
             meta_payload = json.dumps({
                 "strategy": strategy,
                 "pid": process.pid,
                 "started_at": time.time(),
+                "symbols": meta_symbols,
             })
             redis_client = cls._redis()
             if redis_client:
@@ -1223,7 +1229,7 @@ class SessionManager:
                 pipe.execute()
                 print(
                     f"[SessionManager] Redis save ok session={session_id} "
-                    f"pid={process.pid} strategy={strategy}"
+                    f"pid={process.pid} strategy={strategy} symbols={meta_symbols}"
                 )
         except Exception as e:
             print(f"[SessionManager] Redis save failed: {e}")
