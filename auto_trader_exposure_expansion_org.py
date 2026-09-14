@@ -1906,14 +1906,6 @@ class AutoTrader:
                     ctx,
                 )
                 self._track_engine_fill(symbol, broker_pos, ctx)
-                if action_type in ("FLIP_TO_LONG", "FLIP_TO_SHORT"):
-                    print(f"[FLIP] {symbol}: old position closed, opening new {'LONG' if 'LONG' in action_type else 'SHORT'} position @ {exit_price:.2f}")
-                    with self.positions_lock:
-                        self.positions[symbol] = {
-                            "side": "BUY" if "LONG" in action_type else "SELL",
-                            "qty": broker_pos.get("qty", 0),
-                            "entry_price": exit_price,
-                        }
                 return
 
             if exit_price > 0 and symbol in self.positions:
@@ -1930,38 +1922,12 @@ class AutoTrader:
                     pnl
                 )
                 self._track_engine_fill(symbol, broker_pos, ctx)
-                # FLIP: purani position close ho gayi, ab nayi side OPEN karni hai
-                if action_type in ("FLIP_TO_LONG", "FLIP_TO_SHORT"):
-                    print(f"[FLIP] {symbol}: old position closed, opening new {'LONG' if 'LONG' in action_type else 'SHORT'} position @ {exit_price:.2f}")
-                    with self.positions_lock:
-                        self.positions[symbol] = {
-                            "side": "BUY" if "LONG" in action_type else "SELL",
-                            "qty": broker_pos.get("qty", 0),
-                            "entry_price": exit_price,
-                        }
                 return
             elif action_type in ("EXIT_LONG", "COVER_SHORT", "STOP_LOSS", "MARKET_CLOSE_EXIT"):
                 # Missing price/position for normal exit
                 print(f"[WARN] {symbol}: exit price nahi mili ya position exist nahi karti sirf pop kar rahe hain")
                 self.positions.pop(symbol, None)
                 self._track_engine_fill(symbol, broker_pos, ctx)
-                return
-            elif action_type in ("FLIP_TO_LONG", "FLIP_TO_SHORT"):
-                # FLIP with no existing in-memory position = fresh entry of the new side
-                print(f"[FLIP] {symbol}: no existing position, treating as fresh {'LONG' if 'LONG' in action_type else 'SHORT'} entry @ {exit_price:.2f}")
-                if exit_price <= 0:
-                    order_id = ctx.get("order_id")
-                    if order_id:
-                        exit_price = self._get_fill_price_from_orderbook(order_id, symbol)
-                if exit_price <= 0:
-                    print(f"[WARN] {symbol}: flip entry price nahi mili, position set nahi hua")
-                    return
-                with self.positions_lock:
-                    self.positions[symbol] = {
-                        "side": "BUY" if "LONG" in action_type else "SELL",
-                        "qty": broker_pos.get("qty", 0),
-                        "entry_price": exit_price,
-                    }
                 return
 
             return
