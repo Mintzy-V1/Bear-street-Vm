@@ -2374,7 +2374,7 @@ async def start_trading(config: TradingConfig ,x_plugin_api_key: str = Header(No
         worker_started_perf = time.perf_counter()
         is_live_start = not is_simulation_start
         if is_live_start:
-            prep = SessionManager.prepare_for_live_start(session_id, timeout=90)
+            prep = await run_in_threadpool(SessionManager.prepare_for_live_start, session_id)
             if prep == SessionManager.LiveStartPrepResult.LIVE_ALREADY_RUNNING:
                 print(
                     f"[START-TRADING-DEBUG] Live start idempotent — worker already running for {session_id}"
@@ -2442,7 +2442,7 @@ async def start_trading(config: TradingConfig ,x_plugin_api_key: str = Header(No
                         "already_running": True,
                     }
                 else:
-                    SessionManager.ensure_worker_stopped(session_id, timeout=30)
+                    await run_in_threadpool(SessionManager.ensure_worker_stopped, session_id)
                     _spawn_worker()
             else:
                 raise

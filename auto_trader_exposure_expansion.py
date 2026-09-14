@@ -1920,10 +1920,11 @@ class AutoTrader:
     
     def _track_engine_fill(self, symbol, broker_pos, ctx) -> None:
         record_engine_order_for_trader(self, ctx.get("order_id"))
+        fill_qty = int(ctx.get("qty") or broker_pos.get("qty", 0) or 0)
         apply_fill_to_session_ledger(
             self,
             symbol,
-            int(broker_pos.get("qty", 0) or 0),
+            fill_qty,
             ctx.get("action_type", ""),
         )
 
@@ -3760,6 +3761,11 @@ class AutoTrader:
 
             for p in data:
                 try:
+                    # Exit path must never square off CNC/DELIVERY/MIS/carry positions
+                    product = str(p.get("producttype") or p.get("productType") or "").upper()
+                    if product != "INTRADAY":
+                        continue
+
                     net_qty = int(p.get("netqty", 0))
                     if net_qty == 0:
                         continue
@@ -3776,6 +3782,7 @@ class AutoTrader:
                         "symbol": symbol,
                         "side": side,
                         "qty": abs(net_qty),
+                        "product_type": product or "INTRADAY",
                         "avg_price": float(
                             p.get("averageprice")
                             or p.get("avg_price")
