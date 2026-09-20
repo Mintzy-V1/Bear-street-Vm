@@ -99,8 +99,8 @@ class TimingLogger:
 
 # Market timezone: IST (UTC+5:30)
 MARKET_TZ = timezone(timedelta(hours=5, minutes=30))
-AUTO_EXIT_TIME = dt_time(15, 0)          # 3:00 PM IST
-AUTO_EXIT_WARNING_TIME = dt_time(14, 55) # 5 min before flatten
+AUTO_EXIT_TIME = dt_time(14, 50)          # 2:50 PM IST
+AUTO_EXIT_WARNING_TIME = dt_time(14, 45) # 5 min before flatten
 STOP_LOCK_TIME = dt_time(14, 15)         # 14:15 IST — exit losers, continue with greens
 
 # TEMP TEST: when set, trading uses this cash cap instead of full broker RMS.
@@ -1503,6 +1503,7 @@ class AutoTrader:
             f"realized={exit_doc.get('realized_pnl')} unrealized={exit_doc.get('unrealized_pnl')} "
             f"trading_log_cycle={exit_doc.get('display_cycle')}"
         )
+        self._track_engine_fill(symbol, broker_pos, ctx)
         return exit_doc
 
     def _notify_eod_exit_status_to_api(self, reason: str = "MARKET_CLOSE_15:00_IST") -> None:
@@ -1527,7 +1528,7 @@ class AutoTrader:
             print(f"[EOD] exit_status redis notify failed: {e}")
 
     def _trigger_market_close_exit(self, reason: str = "market_close_1500") -> bool:
-        """Idempotent 15:00 session square-off. Safe from watchdog (sleep/active) and the main loop."""
+        """Idempotent 14:50 session square-off. Safe from watchdog (sleep/active) and the main loop."""
         with self._auto_exit_lock:
             if getattr(self, "_auto_exit_done", False):
                 return False
@@ -1549,14 +1550,14 @@ class AutoTrader:
         return bool(ok)
 
     def _auto_exit_watchdog_loop(self):
-        """Fires 15:00 IST session square-off even if the main loop is asleep or mid-cycle."""
-        print("[AUTO-EXIT] watchdog started (15:00 IST, sleep or active cycle)")
+        """Fires 14:50 IST session square-off even if the main loop is asleep or mid-cycle."""
+        print("[AUTO-EXIT] watchdog started (14:50 IST, sleep or active cycle)")
         while not self.stop_event.is_set() and not getattr(self, "_auto_exit_done", False):
             now = self._now_market_time()
             t = now.time()
             if t >= AUTO_EXIT_WARNING_TIME and not self._exit_warning_sent:
                 self._exit_warning_sent = True
-                msg = "14:55 IST - exiting session-operated positions at 15:00 IST (3:00 PM)."
+                msg = "14:45 IST - exiting session-operated positions at 14:50 IST (2:50 PM)."
                 print(f"\n{msg}")
                 try:
                     self.alerts.notify(msg)
@@ -1858,6 +1859,7 @@ class AutoTrader:
             symbol,
             fill_qty,
             ctx.get("action_type", ""),
+            side=ctx.get("side") or broker_pos.get("side") or "",
         )
 
     # ------- HANDLE FILLED -------- 
@@ -1905,7 +1907,6 @@ class AutoTrader:
                     },
                     ctx,
                 )
-                self._track_engine_fill(symbol, broker_pos, ctx)
                 return
 
             if exit_price > 0 and symbol in self.positions:
@@ -2328,7 +2329,7 @@ class AutoTrader:
             missed = int((now - next_run).total_seconds() // (step * 60)) + 1
             next_run += timedelta(minutes=missed * step)
 
-        # Do not sleep past 15:00 IST
+        # Do not sleep past 14:50 IST
         exit_at = now.replace(hour=AUTO_EXIT_TIME.hour, minute=AUTO_EXIT_TIME.minute, second=0, microsecond=0)
         if now < exit_at < next_run:
             next_run = exit_at
@@ -2384,10 +2385,10 @@ class AutoTrader:
 
     def _run_eod_exit_body(self):
         print("\n" + "=" * 80)
-        print("  MARKET CLOSE (3:00 PM IST) - EXITING SESSION POSITIONS")
+        print("  MARKET CLOSE (2:50 PM IST) - EXITING SESSION POSITIONS")
         print("=" * 80)
 
-        self.alerts.notify("3:00 PM IST - Initiating exit of session positions")
+        self.alerts.notify("2:50 PM IST - Initiating exit of session positions")
         self._notify_eod_exit_status_to_api(reason="MARKET_CLOSE_15:00_IST")
 
         with self.broker_pos_lock:
@@ -2586,12 +2587,38 @@ class AutoTrader:
                 self._broker_positions_cache = self._get_broker_positions()
                 broker_positions = list(self._broker_positions_cache or [])
 
-            # 2) Find the target symbol
+            # 2) Find the target symbol (normalize; engine book if Angel list lags)
             target_pos = None
             for pos in broker_positions:
-                if pos["symbol"] == symbol:
+                if self._normalize_config_symbol(pos.get("symbol")) == symbol:
                     target_pos = pos
                     break
+
+            if not target_pos:
+                with self.positions_lock:
+                    internal = dict(self.positions.get(symbol) or {})
+                qty_int = int(internal.get("qty") or 0)
+                side_int = internal.get("side")
+                if qty_int > 0 and side_int in ("BUY", "SELL"):
+                    ltp = 0.0
+                    with self.live_pnl_lock:
+                        tick = (self.live_pnl or {}).get(symbol) or {}
+                        ltp = float(tick.get("ltp") or 0.0)
+                    if ltp <= 0:
+                        ltp = float((getattr(self, "_cycle_ltp_cache", {}) or {}).get(symbol) or 0.0)
+                    if ltp <= 0:
+                        ltp = float(internal.get("entry_price") or 0.0)
+                    target_pos = {
+                        "symbol": symbol,
+                        "side": side_int,
+                        "qty": qty_int,
+                        "ltp": ltp,
+                        "avg_price": float(internal.get("entry_price") or 0.0),
+                    }
+                    print(
+                        f"[SINGLE EXIT] {symbol}: broker list miss — using engine "
+                        f"{side_int} {qty_int}"
+                    )
 
             if not target_pos:
                 msg = f"No open position found for {symbol}"
@@ -2659,6 +2686,7 @@ class AutoTrader:
                         },
                         exit_ctx,
                     )
+                    self._exited_symbols.add(symbol)
                     msg = f"Exit order filled for {symbol} (closed {side} position, qty={qty})"
                     print(f"[SINGLE EXIT] {msg}")
                     return {"success": True, "symbol": symbol, "message": msg, "order_id": result.order_id}
@@ -3088,7 +3116,7 @@ class AutoTrader:
             print(f"[DB ERROR] Trading snapshot insert failed: {e}")
 
     def _persist_eod_exit_trading_logs(self, exit_records: list) -> None:
-        """Save 15:00 / shutdown square-off rows to trading_logs for the frontend."""
+        """Save 14:50 / shutdown square-off rows to trading_logs for the frontend."""
         if not exit_records:
             return
         session_id = getattr(self, "ui_session_id", None) or getattr(self, "session_id", None)
@@ -3345,6 +3373,24 @@ class AutoTrader:
     @staticmethod
     def _normalize_config_symbol(symbol: str) -> str:
         return (symbol or "").upper().replace("-EQ", "").strip()
+
+    def _strip_exited_from_active(self, symbols: list, batch_size: int):
+        """Drop stop-lock / manual exits from this loop's symbol list. No I/O wait."""
+        self._sync_exited_symbols_from_db()
+        if not self._exited_symbols:
+            return symbols, [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)]
+        before_count = len(symbols)
+        symbols = [
+            s for s in symbols
+            if self._normalize_config_symbol(s) not in self._exited_symbols
+        ]
+        symbol_batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)]
+        if len(symbols) < before_count:
+            print(
+                f"[SINGLE EXIT] Removed {sorted(self._exited_symbols)} from active symbols. "
+                f"Remaining: {symbols}"
+            )
+        return symbols, symbol_batches
 
     def _get_symbol_position_qty(self, symbol: str) -> int:
         symbol = self._normalize_config_symbol(symbol)
@@ -3673,7 +3719,7 @@ class AutoTrader:
 
         # NSE cash market typical intraday window
         market_open  = dt_time(9, 15)   # 9:15 AM IST
-        market_close = AUTO_EXIT_TIME   # 3:00 PM IST
+        market_close = AUTO_EXIT_TIME   # 2:50 PM IST
 
         #temp change 
         # Block weekends or outside this time window
@@ -3796,20 +3842,7 @@ class AutoTrader:
                     break    
 
                 # ==================== FILTER EXITED SYMBOLS ====================
-                # If any symbols were manually exited, remove them from the active list
-                self._sync_exited_symbols_from_db()
-                if self._exited_symbols:
-                    before_count = len(symbols)
-                    symbols = [
-                        s for s in symbols
-                        if self._normalize_config_symbol(s) not in self._exited_symbols
-                    ]
-                    symbol_batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)]
-                    removed = self._exited_symbols.copy()
-                    # Don't clear _exited_symbols Ã¢â‚¬â€ keep them excluded permanently
-                    if len(symbols) < before_count:
-                        print(f"[SINGLE EXIT] Removed {removed} from active symbols. Remaining: {symbols}")
-                
+                symbols, symbol_batches = self._strip_exited_from_active(symbols, batch_size)
                 if not symbols:
                     print("[AUTO_TRADER] All symbols have been exited Ã¢â‚¬â€ no more symbols to trade. Stopping.")
                     self.stop_event.set()
@@ -3825,9 +3858,15 @@ class AutoTrader:
                 if not self._stoplock_done and now.time() >= STOP_LOCK_TIME:
                     self._run_stoplock_exits(symbols)
                     self._stoplock_done = True
+                    # Same 14:16 wake — drop losers before this candle's prediction.
+                    symbols, symbol_batches = self._strip_exited_from_active(symbols, batch_size)
+                    if not symbols:
+                        print("[AUTO_TRADER] All symbols exited at stop-lock — stopping.")
+                        self.stop_event.set()
+                        break
 
                 if now.time() >= AUTO_EXIT_WARNING_TIME and not self._exit_warning_sent:
-                    msg = "14:55 IST - exiting session-operated positions at 15:00 IST (3:00 PM)."
+                    msg = "14:45 IST - exiting session-operated positions at 14:50 IST (2:50 PM)."
                     print(f"\n{msg}")
                     self.alerts.notify(msg)
                     self._exit_warning_sent = True
@@ -4108,7 +4147,11 @@ class AutoTrader:
                 for sym, info in signals.items():
                     t_sym_loop = time.time()
                     symbol_action_taken = False
-                    try:   
+                    try:
+                        if self._normalize_config_symbol(sym) in self._exited_symbols:
+                            print(f"[SKIP] {sym}: stop-lock/exited — no new order this candle")
+                            continue
+
                         has_broker_pos = False
                         broker_pos = None
                         
@@ -4237,7 +4280,7 @@ class AutoTrader:
                             continue
 
                         if self._now_market_time().time() >= AUTO_EXIT_WARNING_TIME:
-                            print(f"[ENTRY FREEZE] {sym}: no new entries after 14:55 IST")
+                            print(f"[ENTRY FREEZE] {sym}: no new entries after 14:45 IST")
                             continue
                         
                         print(f"[DEBUG] risk_veto={risk_veto} sig={sig}")
@@ -4930,7 +4973,7 @@ class AutoTrader:
                 self.tlog.record("time after analyse after second broker api call" ,t_after_brp_call , note="time analysis of delay")
 
                 if now_time >= cutoff_time:
-                    self.alerts.notify("Backup market close triggered (15:00 IST)")
+                    self.alerts.notify("Backup market close triggered (14:50 IST)")
                     print("\n" + "=" * 70)
                     print("BACKUP MARKET CLOSE - AUTO-TRADING STOPPED")
                     print("=" * 70)
@@ -4987,7 +5030,7 @@ class AutoTrader:
         self._shutdown_done = True
         self.stop_event.set()
         if getattr(self, "_auto_exit_done", False):
-            print("[SHUTDOWN] 15:00 auto-exit already completed — skip second square-off")
+            print("[SHUTDOWN] 14:50 auto-exit already completed — skip second square-off")
         else:
             print("[SHUTDOWN] Pehle open positions exit kar raha hoon...")
             try:
