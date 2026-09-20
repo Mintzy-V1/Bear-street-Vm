@@ -440,6 +440,76 @@ def test_live_org_pending_exit_blocks_next_cycle():
     assert_equal(db["trading_logs"].docs, [], "live org pending should not create final trading log row")
 
 
+def test_session_ledger_uses_actual_fill_for_entry_drift():
+    from utils.session_ledger import _compute_ledger_qty_after_fill
+
+    # Entry intended 100, broker actually filled 101 (price moved down).
+    # Ledger must record the actual fill, not the intended qty.
+    qty = _compute_ledger_qty_after_fill(0, 101, "OPEN_LONG")
+    assert_equal(qty, 101, "ledger records actual entry fill (drift up)")
+
+    # Exit exactly the held quantity.
+    qty = _compute_ledger_qty_after_fill(101, 101, "EXIT_LONG")
+    assert_equal(qty, 0, "ledger flat after exiting actual fill")
+
+
+def test_session_ledger_flip_nets_to_reversed_side():
+    from utils.session_ledger import _compute_ledger_qty_after_fill
+
+    # 1 PM BUY 6 -> long 6
+    qty = _compute_ledger_qty_after_fill(0, 6, "OPEN_LONG")
+    assert_equal(qty, 6, "long 6 after entry")
+
+    # 2:45 PM flip: sell 12 to square 6 and open 6 short -> net -6
+    qty = _compute_ledger_qty_after_fill(6, 12, "FLIP_TO_SHORT")
+    assert_equal(qty, -6, "flip nets to short 6")
+
+    # Cover the 6 short back to flat.
+    qty = _compute_ledger_qty_after_fill(-6, 6, "COVER_SHORT")
+    assert_equal(qty, 0, "flat after covering short")
+
+
+def test_track_engine_fill_prefers_actual_broker_qty():
+    trader, db = make_trader()
+    trader._session_open_qty = {}
+    trader._session_open_qty_lock = trader._session_open_qty_lock
+    trader.market_client.redis_client = FakeRedis()
+
+    # ctx.qty is the INTENDED qty (100); broker_pos.qty is the ACTUAL fill (101).
+    # _track_engine_fill must feed the ledger the actual, not the intended.
+    ctx = {"order_id": "ORD-101", "qty": 100, "action_type": "OPEN_LONG"}
+    trader._track_engine_fill("INFY", {"qty": 101}, ctx)
+
+    from utils.session_ledger import get_session_ledger
+    ledger = get_session_ledger(trader)
+    assert_equal(ledger.get("INFY"), 101, "ledger tracks actual fill not intended")
+
+
+def test_own_exit_qty_ignores_manual_trades_on_same_symbol():
+    trader, db = make_trader()
+    trader._session_open_qty = {"ITC": 100}
+    trader._session_open_qty_lock = trader._session_open_qty_lock
+
+    # Engine opened 100, someone manually opened another 100 -> broker shows 200.
+    # System must exit only its own 100.
+    exit_qty = trader._own_exit_qty("ITC", 200)
+    assert_equal(exit_qty, 100, "exit capped to engine own qty, not broker 200")
+
+    # Engine short 100, broker shows 150 (manual short 50). Exit own 100 only.
+    trader._session_open_qty = {"ITC": -100}
+    exit_qty = trader._own_exit_qty("ITC", 150)
+    assert_equal(exit_qty, 100, "short exit capped to engine own qty")
+
+    # Broker has less than own (manual closed some) -> never exit more than held.
+    exit_qty = trader._own_exit_qty("ITC", 40)
+    assert_equal(exit_qty, 40, "never exit more than broker holds")
+
+    # Ledger empty (paper / ledger off) -> fall back to broker qty.
+    trader._session_open_qty = {}
+    exit_qty = trader._own_exit_qty("ITC", 200)
+    assert_equal(exit_qty, 200, "fallback to broker qty when ledger empty")
+
+
 def run_all():
     tests = [
         test_pending_exit_snapshot,
@@ -449,6 +519,10 @@ def run_all():
         test_db_sync_blocks_pending_and_exited_symbols,
         test_live_org_final_exit_writes_exited_symbols_and_trading_logs,
         test_live_org_pending_exit_blocks_next_cycle,
+        test_session_ledger_uses_actual_fill_for_entry_drift,
+        test_session_ledger_flip_nets_to_reversed_side,
+        test_track_engine_fill_prefers_actual_broker_qty,
+        test_own_exit_qty_ignores_manual_trades_on_same_symbol,
     ]
     for test in tests:
         test()

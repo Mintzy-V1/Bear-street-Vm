@@ -23,6 +23,7 @@ import traceback
 from trading_snapshot import insert_trading_snapshot
 from utils.session_ledger import (
     apply_fill_to_session_ledger,
+    get_session_ledger,
     record_engine_order_for_trader,
 )
 from utils.eod_exit import (
@@ -1917,10 +1918,67 @@ class AutoTrader:
         except Exception as e:
             print(f"[FILL PRICE ERROR] {symbol}: {e}")
             return 0.0   
-    
+
+    def _get_fill_from_orderbook(self, order_id, symbol):
+        """Return {"avg_price": float, "filled_qty": int} for a completed own order, else {}."""
+        if not order_id:
+            return {}
+        broker = getattr(self, "broker", None)
+        if broker is None or not hasattr(broker, "get_order_book"):
+            return {}
+        try:
+            ob = broker.get_order_book(self.session)
+            if ob.get("status") != "success":
+                return {}
+            orders = ob.get("raw", {}).get("data", [])
+            if not isinstance(orders, list):
+                return {}
+            for order in orders:
+                if str(order.get("orderid")) != str(order_id):
+                    continue
+                order_status = str(order.get("orderstatus", "")).lower()
+                if order_status in ("cancelled", "rejected"):
+                    return {}
+                if order_status not in ("complete", "filled"):
+                    return {}
+                avg_price = float(order.get("averageprice") or 0.0)
+                fill_price = float(order.get("price") or 0.0)
+                filled_qty = int(order.get("filledshares") or 0)
+                price = avg_price if avg_price > 0 else fill_price
+                if price <= 0 or filled_qty <= 0:
+                    return {}
+                return {"avg_price": price, "filled_qty": filled_qty}
+            return {}
+        except Exception as e:
+            print(f"[FILL FROM ORDERBOOK ERROR] {symbol}: {e}")
+            return {}
+
+    def _own_session_qty(self, symbol: str) -> int:
+        """Signed qty the engine actually holds for this symbol (own fills only)."""
+        sym = self._normalize_config_symbol(symbol)
+        return int(get_session_ledger(self).get(sym, 0) or 0)
+
+    def _own_exit_qty(self, symbol: str, broker_qty: int) -> int:
+        """
+        Exit qty capped to the engine's own position: min(|own ledger|, broker qty).
+        Never exits more than the engine opened, even if manual trades share the symbol.
+        Falls back to broker_qty when the ledger is empty (ledger feature off / paper).
+        """
+        own = self._own_session_qty(symbol)
+        if own == 0:
+            return max(int(broker_qty or 0), 0)
+        return max(min(abs(own), int(broker_qty or 0)), 0)
+
     def _track_engine_fill(self, symbol, broker_pos, ctx) -> None:
         record_engine_order_for_trader(self, ctx.get("order_id"))
-        fill_qty = int(ctx.get("qty") or broker_pos.get("qty", 0) or 0)
+        # Prefer actual fill qty: broker_pos is authoritative in reconcile paths,
+        # orderbook is the fallback when it isn't populated yet.
+        fill_qty = int(broker_pos.get("qty") or ctx.get("qty") or 0)
+        order_id = ctx.get("order_id")
+        if fill_qty <= 0 and order_id:
+            fill = self._get_fill_from_orderbook(order_id, symbol)
+            if fill and int(fill.get("filled_qty") or 0) > 0:
+                fill_qty = int(fill["filled_qty"])
         apply_fill_to_session_ledger(
             self,
             symbol,
@@ -4210,7 +4268,7 @@ class AutoTrader:
                 return {"success": False, "symbol": symbol, "message": msg}
 
             side = target_pos["side"]
-            qty = target_pos["qty"]
+            qty = self._own_exit_qty(symbol, target_pos["qty"])
             curr_price = target_pos.get("ltp", 0.0)
             exit_side = "SELL" if side == "BUY" else "BUY"
             pre_exit_position = self._snapshot_position_for_exit(symbol, target_pos)
@@ -4373,10 +4431,15 @@ class AutoTrader:
                     # ----------------------------------------
                     if is_flip:
                         exit_price = 0.0
+                        flip_qty = expected_qty
                         if order_id:
                             check_ts = datetime.now()
                             print(f"[DEBUG-RECONCILE] [{check_ts.strftime('%H:%M:%S.%f')[:-3]}] Checking flip pending order_id {order_id} for {sym}")
-                            exit_price = self._get_fill_price_from_orderbook(order_id, sym)
+                            fill_info = self._get_fill_from_orderbook(order_id, sym)
+                            if fill_info:
+                                exit_price = float(fill_info.get("avg_price") or 0.0)
+                                if int(fill_info.get("filled_qty") or 0) > 0:
+                                    flip_qty = int(fill_info["filled_qty"])
                         
                         if exit_price <= 0:
                             print(f"[DEBUG-RECONCILE] Flip Order {order_id} not executed yet. Retaining in pending list.")
@@ -4387,7 +4450,7 @@ class AutoTrader:
                             sym,
                             {
                                 "side": "BUY" if "LONG" in action_type else "SELL",
-                                "qty": expected_qty,
+                                "qty": flip_qty,
                                 "avg_price": exit_price,
                             },
                             ctx,
@@ -4426,11 +4489,17 @@ class AutoTrader:
                         filled_qty = min(broker_qty, expected_qty)
                         avg_price = float(pos.get("avg_price") or 0.0)
 
-                        if avg_price <= 0 and order_id:
-                            avg_price = self._get_fill_price_from_orderbook(order_id, sym)
-                            if avg_price > 0:
-                                print(f"[RECONCILE] {sym}: avg_price order book se mili Ãƒâ€šÃ‚Â¹{avg_price:.2f}")
-                            else:
+                        # Actual fill from orderbook (covers qty drift 99/101 vs intended
+                        # and missing avg_price in one call).
+                        if order_id and (broker_qty != expected_qty or avg_price <= 0):
+                            fill_info = self._get_fill_from_orderbook(order_id, sym)
+                            if fill_info:
+                                if int(fill_info.get("filled_qty") or 0) > 0:
+                                    filled_qty = int(fill_info["filled_qty"])
+                                if avg_price <= 0 and float(fill_info.get("avg_price") or 0.0) > 0:
+                                    avg_price = float(fill_info["avg_price"])
+                                    print(f"[RECONCILE] {sym}: avg_price order book se mili Ãƒâ€šÃ‚Â¹{avg_price:.2f}")
+                            if avg_price <= 0:
                                 print(f"[RECONCILE] {sym}: avg_price abhi bhi 0  next cycle mein retry hoga")
 
                         self._handle_filled(
@@ -4466,10 +4535,15 @@ class AutoTrader:
 
                         if not still_exists:
                             exit_price = 0.0
+                            exit_qty = expected_qty
                             if order_id:
                                 check_ts = datetime.now()
                                 print(f"[DEBUG-RECONCILE] [{check_ts.strftime('%H:%M:%S.%f')[:-3]}] Checking pending order_id {order_id} for {sym}")
-                                exit_price = self._get_fill_price_from_orderbook(order_id, sym)
+                                fill_info = self._get_fill_from_orderbook(order_id, sym)
+                                if fill_info:
+                                    exit_price = float(fill_info.get("avg_price") or 0.0)
+                                    if int(fill_info.get("filled_qty") or 0) > 0:
+                                        exit_qty = int(fill_info["filled_qty"])
                                 ret_ts = datetime.now()
                                 print(f"[DEBUG-RECONCILE] [{ret_ts.strftime('%H:%M:%S.%f')[:-3]}] Orderbook API returned exit_price: {exit_price} for {sym} (order_id {order_id})")
 
@@ -4482,7 +4556,7 @@ class AutoTrader:
                                 sym,
                                 {
                                     "side": expected_side,
-                                    "qty": expected_qty,
+                                    "qty": exit_qty,
                                     "avg_price": exit_price  # price already realized
                                 },
                                 ctx
@@ -5663,7 +5737,7 @@ class AutoTrader:
                             sl_pct = self.symbol_allocations[sym].get("stop_loss")
                             if sl_pct is not None and sl_pct > 0:
                                 entry_price = broker_pos["avg_price"]
-                                qty = broker_pos["qty"]
+                                qty = self._own_exit_qty(sym, broker_pos["qty"])
                                 position_side = broker_pos["side"]
                                 if entry_price <= 0 or qty <= 0 or not position_side:
                                     continue
@@ -5892,7 +5966,7 @@ class AutoTrader:
                         # SCENARIO 3: EXIT LONG & REVERSE TO SHORT
                         if sig == "SELL" and has_broker_pos and broker_pos["side"] == "BUY" and sym not in self.pending_orders:
                             scenario_name = "SELL (Flip Long to Short)"
-                            qty = broker_pos["qty"]
+                            qty = self._own_exit_qty(sym, broker_pos["qty"])
                             inverted_qty = qty*2                 # EXIT LONG -> OPEN SHORT (same qty)
                             print(f"[ORDER QUEUED] {sym} {sig} qty={qty}")
 
@@ -5918,7 +5992,7 @@ class AutoTrader:
                         # SCENARIO 4: EXIT SHORT & REVERSE TO LONG
                         if sig == "BUY" and has_broker_pos and broker_pos["side"] == "SELL" and sym not in self.pending_orders:
                             scenario_name = "BUY (Flip Short to Long)"
-                            qty = broker_pos["qty"]
+                            qty = self._own_exit_qty(sym, broker_pos["qty"])
                             inverted_qty = qty*2                # EXIT SHORT -> OPEN LONG (same qty)
                             print(f"[ORDER QUEUED] {sym} {sig} qty={qty}")
                     
