@@ -238,6 +238,10 @@ class ParallelOrderExecutor:
                 f"trigger={order_req.trigger_price}"
             )
             
+            from utils.bear_street_order_pricing import reference_ltp_from_order
+
+            meta = order_req.metadata or {}
+            reference_ltp = reference_ltp_from_order(order_req)
             order_response = self.broker.place_order(
                 session=self.session,
                 symbol=order_req.symbol,
@@ -248,7 +252,9 @@ class ParallelOrderExecutor:
                 price=order_req.price,
                 stop_loss=order_req.stop_loss,
                 trigger_price=order_req.trigger_price,
-                wait_for_confirmation=False
+                wait_for_confirmation=False,
+                reference_ltp=reference_ltp,
+                prev_close=meta.get("prev_close"),
             )
             
             print("\n[EXECUTOR] place_order raw response:")

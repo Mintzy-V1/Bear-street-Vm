@@ -42,6 +42,12 @@ from bear_street_client.models.bracket_order import (
 )
 from bear_street_client.models.position_conversion import PositionConversionRequest
 
+from utils.bear_street_order_pricing import (
+    compute_limit_price,
+    get_bear_street_order_pricing_config,
+    log_bear_street_order_pricing_config,
+)
+
 
 def _pick(row, *keys, default=None):
     for k in keys:
@@ -386,33 +392,20 @@ class BrokerConnector:
     # REGULAR ORDERS
     # -------------------------------------------------------------------------
 
-    def place_order(self, session, symbol, side, qty=None, quantity=None, price=None,
-                    order_type="MARKET", product_type="INTRADAY", exchange="NSE_EQ",
-                    variety="NORMAL", lot_based=False, stop_loss=None,
-                    trigger_price=None, wait_for_confirmation=True, **kwargs):
-        qty = qty or quantity
-        if qty is None:
-            return {"status": "error", "error": "Missing quantity/qty argument", "filled": False}
-        if not session or "obj" not in session:
-            return {"status": "error", "error": "No active session object provided.", "filled": False}
-
-        side_upper = side.upper().replace("_", "").replace(" ", "")
-        if side_upper in ("BUY", "LONG", "BUYCOVER", "COVER"):
-            api_side = "BUY"
-        elif side_upper in ("SELL", "SHORT", "SHORTSELL", "SELLSHORT"):
-            api_side = "SELL"
-        else:
-            return {"status": "error", "error": f"Invalid side: {side}", "filled": False}
-
-        bear_exchange = exchange
-        bear_product = product_type.upper()
-        is_market = order_type.upper() in ("MARKET", "RL-MKT")
-        bear_order_type = "RL-MKT" if is_market else "RL"
-        if stop_loss or trigger_price:
-            bear_order_type = "SL" if not is_market else "SL-MKT"
-        price_value = 0.0 if is_market else float(price or 0)
-        trigger_value = float(trigger_price or stop_loss or 0)
-
+    def _submit_regular_order(
+        self,
+        session,
+        *,
+        symbol,
+        api_side,
+        qty,
+        bear_product,
+        bear_order_type,
+        price_value,
+        trigger_value,
+        bear_exchange,
+        kwargs,
+    ):
         scrip_token = kwargs.get("scrip_token") or self.get_symbol_token(symbol, bear_exchange)
         scrip = ScripInfo(
             exchange=bear_exchange,
@@ -433,25 +426,154 @@ class BrokerConnector:
             order_identifier=kwargs.get("order_identifier"),
         )
 
+        print(
+            f"[ORDER] Bear Street {api_side} {symbol} x {qty} @ {price_value} "
+            f"product={bear_product} type={bear_order_type}"
+        )
         try:
-            print(f"[ORDER] Bear Street {api_side} {symbol} x {qty} @ {price_value} product={bear_product} type={bear_order_type}")
             resp = self._call_api(session["obj"].place_order, req.get_dict())
-            order_id = None
-            if isinstance(resp, dict):
-                data = resp.get("data") or {}
-                order_id = resp.get("order_id") or data.get("orderId") or data.get("order_id")
+        except BearStreetAPIError as ex:
+            return {"status": "error", "error": str(ex), "filled": False}
+        except RuntimeError as ex:
+            return {"status": "error", "error": str(ex), "filled": False}
+        except Exception as ex:
+            return {"status": "error", "error": str(ex), "filled": False}
 
-            if not order_id:
-                return {"status": "error", "error": "No order ID in response", "filled": False, "raw": resp}
+        order_id = None
+        if isinstance(resp, dict):
+            data = resp.get("data") or {}
+            order_id = resp.get("order_id") or data.get("orderId") or data.get("order_id")
+        else:
+            data = getattr(resp, "data", None)
+            if data is not None:
+                order_id = getattr(data, "order_id", None) or getattr(data, "orderId", None)
+        if not order_id:
+            err = "No order ID in response"
+            if isinstance(resp, dict):
+                err = resp.get("message") or resp.get("error") or err
+            return {
+                "status": "error",
+                "error": err,
+                "filled": False,
+                "raw": resp,
+            }
+        return {"status": "success", "order_id": order_id, "filled": None, "raw": resp}
+
+    def place_order(self, session, symbol, side, qty=None, quantity=None, price=None,
+                    order_type="MARKET", product_type="INTRADAY", exchange="NSE_EQ",
+                    variety="NORMAL", lot_based=False, stop_loss=None,
+                    trigger_price=None, wait_for_confirmation=True, **kwargs):
+        qty = qty or quantity
+        if qty is None:
+            return {"status": "error", "error": "Missing quantity/qty argument", "filled": False}
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided.", "filled": False}
+
+        side_upper = side.upper().replace("_", "").replace(" ", "")
+        if side_upper in ("BUY", "LONG", "BUYCOVER", "COVER"):
+            api_side = "BUY"
+        elif side_upper in ("SELL", "SHORT", "SHORTSELL", "SELLSHORT"):
+            api_side = "SELL"
+        else:
+            return {"status": "error", "error": f"Invalid side: {side}", "filled": False}
+
+        bear_exchange = exchange
+        bear_product = product_type.upper()
+        trigger_value = float(trigger_price or stop_loss or 0)
+        is_sl = bool(stop_loss or trigger_price)
+
+        reference_ltp = kwargs.get("reference_ltp")
+        try:
+            reference_ltp = float(reference_ltp) if reference_ltp is not None else None
+        except (TypeError, ValueError):
+            reference_ltp = None
+        if reference_ltp is not None and reference_ltp <= 0:
+            reference_ltp = None
+
+        prev_close = kwargs.get("prev_close")
+        try:
+            prev_close = float(prev_close) if prev_close is not None else None
+        except (TypeError, ValueError):
+            prev_close = None
+        if prev_close is not None and prev_close <= 0:
+            prev_close = None
+
+        cfg = get_bear_street_order_pricing_config()
+        pricing_details = None
+
+        if is_sl:
+            is_market = order_type.upper() in ("MARKET", "RL-MKT", "SL-MKT")
+            bear_order_type = "SL-MKT" if is_market else "SL"
+            price_value = 0.0 if is_market else float(price or 0)
+        else:
+            if reference_ltp is None and not price:
+                return {
+                    "status": "error",
+                    "error": "Limit order requires reference_ltp or price",
+                    "filled": False,
+                }
+            if price and float(price or 0) > 0:
+                price_value = float(price)
+            else:
+                price_value, pricing_details = compute_limit_price(
+                    api_side,
+                    reference_ltp,
+                    symbol=symbol,
+                    prev_close=prev_close,
+                    cfg=cfg,
+                )
+            bear_order_type = "RL"
+
+        try:
+            if not getattr(self, "_order_pricing_logged", False):
+                log_bear_street_order_pricing_config()
+                self._order_pricing_logged = True
+
+            resp = self._submit_regular_order(
+                session,
+                symbol=symbol,
+                api_side=api_side,
+                qty=qty,
+                bear_product=bear_product,
+                bear_order_type=bear_order_type,
+                price_value=price_value,
+                trigger_value=trigger_value,
+                bear_exchange=bear_exchange,
+                kwargs=kwargs,
+            )
+
+            order_id = resp.get("order_id")
+            if resp.get("status") == "error" or not order_id:
+                err = resp.get("error") or "No order ID in response"
+                return {"status": "error", "error": err, "filled": False, "raw": resp.get("raw")}
 
             if wait_for_confirmation:
                 confirmation = self._wait_for_order_confirmation(session, order_id)
                 if confirmation.get("filled"):
-                    return {"status": "success", "order_id": order_id, "filled": True,
-                            "avg_price": confirmation["avg_price"], "raw": resp}
-                return {"status": "error", "order_id": order_id, "filled": False,
-                        "error": confirmation["message"], "raw": resp}
-            return {"status": "success", "order_id": order_id, "filled": None, "raw": resp}
+                    return {
+                        "status": "success",
+                        "order_id": order_id,
+                        "filled": True,
+                        "avg_price": confirmation["avg_price"],
+                        "raw": resp.get("raw"),
+                        "pricing": pricing_details,
+                    }
+                return {
+                    "status": "error",
+                    "order_id": order_id,
+                    "filled": False,
+                    "error": confirmation["message"],
+                    "raw": resp.get("raw"),
+                }
+            out = {
+                "status": "success",
+                "order_id": order_id,
+                "filled": None,
+                "raw": resp.get("raw"),
+            }
+            if pricing_details:
+                out["pricing"] = pricing_details
+            return out
         except RuntimeError:
             raise
         except Exception as e:

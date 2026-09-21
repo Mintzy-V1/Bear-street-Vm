@@ -16,6 +16,12 @@ def log_eod_config() -> None:
         f"EOD_USE_SESSION_LEDGER={os.environ.get('EOD_USE_SESSION_LEDGER', 'true')} "
         f"EOD_STRICT_REDIS_META={os.environ.get('EOD_STRICT_REDIS_META', 'false')}"
     )
+    try:
+        from utils.bear_street_order_pricing import log_bear_street_order_pricing_config
+
+        log_bear_street_order_pricing_config()
+    except Exception:
+        pass
 
 
 def _ensure_eod_state(trader) -> None:
