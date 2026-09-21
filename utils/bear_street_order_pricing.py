@@ -8,8 +8,8 @@ from typing import Any, Mapping, Optional
 # Hardcoded production defaults — edit here before VM deploy (no env vars).
 # ---------------------------------------------------------------------------
 BEAR_STREET_ORDER_MODE = "limit"
-BEAR_STREET_LIMIT_BUY_BPS = 50.0
-BEAR_STREET_LIMIT_SELL_BPS = 50.0
+BEAR_STREET_LIMIT_BUY_BPS = 5.0
+BEAR_STREET_LIMIT_SELL_BPS = 5.0
 BEAR_STREET_LIMIT_BPS_CAP = 200.0
 BEAR_STREET_DEFAULT_BAND_PCT = 0.10
 BEAR_STREET_RESPECT_NSE_BAND = True
@@ -19,8 +19,8 @@ BEAR_STREET_SYMBOL_BAND_PCT: dict[str, float] = {}
 @dataclass(frozen=True)
 class BearStreetOrderPricingConfig:
     mode: str = "limit"
-    buy_bps: float = 50.0
-    sell_bps: float = 50.0
+    buy_bps: float = 5.0
+    sell_bps: float = 5.0
     bps_cap: float = 200.0
     default_band_pct: float = 0.10
     respect_nse_band: bool = True
