@@ -46,8 +46,13 @@ fi
 MASTER=$(pgrep -f 'gunicorn -w 2 -k uvicorn.workers.UvicornWorker' | head -1 || true)
 if [ -n "$MASTER" ]; then
   echo "==> Restarting gunicorn (master $MASTER)"
-  kill "$MASTER"
-  sleep 4
+  pkill -f 'gunicorn -w 2 -k uvicorn.workers.UvicornWorker' || true
+  for i in $(seq 1 10); do
+    if ! pgrep -f 'gunicorn -w 2 -k uvicorn.workers.UvicornWorker' >/dev/null; then break; fi
+    sleep 1
+  done
+  pgrep -f 'gunicorn -w 2 -k uvicorn.workers.UvicornWorker' | xargs -r kill -9 || true
+  sleep 2
 fi
 
 if screen -ls 2>/dev/null | grep -q 'mintzy-plugin'; then
@@ -61,8 +66,13 @@ else
     >> server.log 2>&1 &
 fi
 
-sleep 6
-curl -sf -o /dev/null http://localhost:8000/ && echo "HEALTH_OK" || { echo "HEALTH_FAIL"; exit 1; }
+for i in $(seq 1 30); do
+  if curl -sf -o /dev/null --max-time 3 http://localhost:8000/; then
+    echo "HEALTH_OK"; exit 0
+  fi
+  sleep 2
+done
+echo "HEALTH_FAIL"; exit 1
 REMOTE
 
 echo "==> Deploy done"
