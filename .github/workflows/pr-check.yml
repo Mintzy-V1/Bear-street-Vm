@@ -1,0 +1,20 @@
+name: PR Check
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compile check (Python)
+        run: |
+          python3 -m py_compile \
+            api_server.py auto_trader.py auto_trader_exposure_expansion.py \
+            session_manager.py broker_factory.py utils/bear_street_order_pricing.py \
+            utils/session_ledger.py
+          echo "COMPILE_OK"
