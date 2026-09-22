@@ -515,12 +515,14 @@ class BrokerConnector:
             if price and float(price or 0) > 0:
                 price_value = float(price)
             else:
+                symbol_tick = self.get_symbol_tick(symbol, bear_exchange)
                 price_value, pricing_details = compute_limit_price(
                     api_side,
                     reference_ltp,
                     symbol=symbol,
                     prev_close=prev_close,
                     cfg=cfg,
+                    tick=symbol_tick,
                 )
             bear_order_type = "RL"
 
@@ -890,22 +892,7 @@ class BrokerConnector:
     def get_symbol_token(self, tradingsymbol, exchange="NSE_EQ", prefer_field="code"):
         """Resolve a scrip token from the ODIN scrip master (cached to disk)."""
         try:
-            import json, os, urllib.request
-            from pathlib import Path
-            base_dir = Path(__file__).resolve().parent
-            cache_path = base_dir / f"scripmaster_{exchange}.json"
-            data = None
-            if cache_path.exists():
-                try:
-                    with open(cache_path) as f:
-                        data = json.load(f)
-                except Exception:
-                    data = None
-            if data is None:
-                url = f"https://odinscripmaster.s3.ap-south-1.amazonaws.com/scripfiles/{exchange}.json"
-                data = json.load(urllib.request.urlopen(url, timeout=30))
-                with open(cache_path, "w") as f:
-                    json.dump(data, f)
+            data = self._load_scripmaster(exchange)
             sym_upper = tradingsymbol.upper().replace("-EQ", "")
             if isinstance(data, list):
                 for item in data:
@@ -922,3 +909,50 @@ class BrokerConnector:
         except Exception:
             pass
         return None
+
+    def get_symbol_tick(self, tradingsymbol, exchange="NSE_EQ"):
+        """Resolve the per-symbol price tick (in rupees) from the ODIN scrip master.
+
+        The scrip master stores tick in paise (e.g. HEROMOTOCO tick=50 => 0.50).
+        Returns None when unknown so callers can fall back to the generic table.
+        """
+        try:
+            data = self._load_scripmaster(exchange)
+            sym_upper = tradingsymbol.upper().replace("-EQ", "")
+            tick = None
+            if isinstance(data, list):
+                for item in data:
+                    if (item.get("sym") or "").upper() == sym_upper:
+                        tick = item.get("tick")
+                        break
+            elif isinstance(data, dict):
+                for k, v in data.items():
+                    if k.upper() == sym_upper:
+                        if isinstance(v, dict):
+                            tick = v.get("tick")
+                        break
+            if tick is None:
+                return None
+            return float(tick) / 100.0
+        except Exception:
+            return None
+
+    def _load_scripmaster(self, exchange="NSE_EQ"):
+        """Load the ODIN scrip master JSON (cached to disk)."""
+        import json, os, urllib.request
+        from pathlib import Path
+        base_dir = Path(__file__).resolve().parent
+        cache_path = base_dir / f"scripmaster_{exchange}.json"
+        data = None
+        if cache_path.exists():
+            try:
+                with open(cache_path) as f:
+                    data = json.load(f)
+            except Exception:
+                data = None
+        if data is None:
+            url = f"https://odinscripmaster.s3.ap-south-1.amazonaws.com/scripfiles/{exchange}.json"
+            data = json.load(urllib.request.urlopen(url, timeout=30))
+            with open(cache_path, "w") as f:
+                json.dump(data, f)
+        return data

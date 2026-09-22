@@ -8,3 +8,6 @@ logs/
 venv/
 _odin_feed_probe/
 .env.example
+
+# live Upstox tokens (VM-only)
+utils/upstox_token.json

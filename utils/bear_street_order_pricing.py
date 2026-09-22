@@ -1,6 +1,7 @@
 """Bear Street live order pricing: band-aware RL limit orders (hardcoded config)."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
@@ -106,6 +107,24 @@ def round_to_nse_tick(price: float) -> float:
     return round(round(p / tick) * tick, 2)
 
 
+def round_to_symbol_tick(price: float, tick: Optional[float], side: str = "") -> float:
+    """Round to the broker's per-symbol tick (in rupees).
+
+    Direction-aware: round UP for buys, DOWN for sells so the limit stays
+    aggressive enough to fill. Falls back to the generic NSE table when the
+    symbol tick is unknown.
+    """
+    p = float(price)
+    if p <= 0:
+        return 0.0
+    t = float(tick) if tick and float(tick) > 0 else None
+    if t is None:
+        return round_to_nse_tick(p)
+    if _side_is_buy(side):
+        return round(math.ceil(p / t) * t, 2)
+    return round(math.floor(p / t) * t, 2)
+
+
 def band_pct_for_symbol(symbol: str, cfg: Optional[BearStreetOrderPricingConfig] = None) -> float:
     cfg = cfg or get_bear_street_order_pricing_config()
     sym = normalize_symbol(symbol)
@@ -152,6 +171,7 @@ def compute_limit_price(
     symbol: str = "",
     prev_close: Optional[float] = None,
     cfg: Optional[BearStreetOrderPricingConfig] = None,
+    tick: Optional[float] = None,
 ) -> tuple[float, dict[str, Any]]:
     cfg = cfg or get_bear_street_order_pricing_config()
     if ltp <= 0:
@@ -174,7 +194,7 @@ def compute_limit_price(
         else:
             raw = max(raw, lower)
 
-    limit_price = round_to_nse_tick(raw)
+    limit_price = round_to_symbol_tick(raw, tick, side if tick else "")
     if limit_price <= 0:
         raise ValueError(f"computed invalid limit price for {symbol} side={side} ltp={ltp}")
 
@@ -185,5 +205,6 @@ def compute_limit_price(
         "applied_bps": bps,
         "raw_limit": raw,
         "limit_price": limit_price,
+        "tick": tick,
     }
     return limit_price, details
