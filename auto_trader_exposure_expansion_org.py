@@ -3559,6 +3559,28 @@ class AutoTrader:
         print(f"[STOPLOCK] {summary}")
         self.alerts.notify(summary)
 
+    def _apply_stoplock_after_cycle(self, symbols: list, batch_size: int):
+        """
+        Once per day after a prediction cycle (14:16 75m wake): exit losers, strip symbols.
+        Returns (symbols, symbol_batches, stop_trader).
+        """
+        if self._stoplock_done:
+            batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)]
+            return symbols, batches, False
+
+        if self._now_market_time().time() < STOP_LOCK_TIME:
+            batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)]
+            return symbols, batches, False
+
+        self._run_stoplock_exits(symbols)
+        self._stoplock_done = True
+        symbols, symbol_batches = self._strip_exited_from_active(symbols, batch_size)
+        if not symbols:
+            print("[AUTO_TRADER] All symbols exited at stop-lock — stopping.")
+            self.stop_event.set()
+            return symbols, symbol_batches, True
+        return symbols, symbol_batches, False
+
     def convert_candle_to_seconds(self, c):
         c = str(c).lower().strip()
 
@@ -3935,16 +3957,6 @@ class AutoTrader:
                 # =====================================================
                 now = self._now_market_time()
 
-                if not self._stoplock_done and now.time() >= STOP_LOCK_TIME:
-                    self._run_stoplock_exits(symbols)
-                    self._stoplock_done = True
-                    # Same 14:16 wake — drop losers before this candle's prediction.
-                    symbols, symbol_batches = self._strip_exited_from_active(symbols, batch_size)
-                    if not symbols:
-                        print("[AUTO_TRADER] All symbols exited at stop-lock — stopping.")
-                        self.stop_event.set()
-                        break
-
                 if now.time() >= AUTO_EXIT_WARNING_TIME and not self._exit_warning_sent:
                     msg = "14:45 IST - exiting session-operated positions at 14:50 IST (2:50 PM)."
                     print(f"\n{msg}")
@@ -4101,6 +4113,11 @@ class AutoTrader:
                     print("calling sleep_until_next_candle")
                     self.tlog.record("PREDICTION_BATCH_TOTAL", t_pred_start, note="EMPTY_RESULT")
 
+                    symbols, symbol_batches, stop_all = self._apply_stoplock_after_cycle(
+                        symbols, batch_size
+                    )
+                    if stop_all:
+                        break
                     self._sleep_until_next_candle(candle)
                     continue
 
@@ -5051,6 +5068,12 @@ class AutoTrader:
                 cutoff_time = AUTO_EXIT_TIME
                 print("time after analyse after second broker api call : ", time.time()- t_after_brp_call)
                 self.tlog.record("time after analyse after second broker api call" ,t_after_brp_call , note="time analysis of delay")
+
+                symbols, symbol_batches, stop_all = self._apply_stoplock_after_cycle(
+                    symbols, batch_size
+                )
+                if stop_all:
+                    break
 
                 if now_time >= cutoff_time:
                     self.alerts.notify("Backup market close triggered (14:50 IST)")
