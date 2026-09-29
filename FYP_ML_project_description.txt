@@ -1,0 +1,79 @@
+Project 3: Automatic Modulation Classification using Deep Learning
+Source repo: C:\Users\Hp\Desktop\fyp_ml_project
+
+Overview:
+This project implements an Automatic Modulation Classification (AMC) system for identifying radio signal modulation schemes from raw I/Q samples. It uses a lightweight 1D Convolutional Neural Network trained on the RadioML 2016.10A dataset to classify six modulation types: 8PSK, AM-DSB, AM-SSB, BPSK, QAM16, and QPSK. The project includes dataset preprocessing, model training, evaluation visualizations, random live-signal prediction simulation, TensorFlow Lite export, and a Streamlit dashboard for running the full ML pipeline.
+
+Tech Stack:
+- Language: Python
+- ML/DL Framework: TensorFlow, Keras
+- Data Processing: NumPy, pickle, scikit-learn
+- Model Architecture: 1D-CNN with Conv1D, BatchNormalization, MaxPooling1D, Dense, Dropout, and Softmax layers
+- Evaluation: scikit-learn metrics, confusion matrix, classification report, F1-score analysis
+- Visualization: Matplotlib, Seaborn
+- App/UI: Streamlit
+- Deployment Format: TensorFlow Lite with post-training quantization
+- Dataset: DeepSig RadioML 2016.10A I/Q signal dataset
+
+Main Features:
+- Loads and preprocesses RadioML 2016.10A signal data from a pickle dataset.
+- Filters the classification problem to six important modulation schemes: 8PSK, AM-DSB, AM-SSB, BPSK, QAM16, and QPSK.
+- Uses only clean/usable signals with SNR >= 0 dB to focus on practical receiver conditions.
+- Converts raw I/Q samples from shape (2, 128) to model-ready sequence format (128, 2).
+- One-hot encodes modulation labels using scikit-learn LabelBinarizer.
+- Splits data into train/test sets with a 70/30 split and fixed random state for repeatability.
+- Builds a lightweight 1D-CNN optimized for time-series signal classification.
+- Uses three convolutional blocks with batch normalization and max pooling for feature extraction.
+- Uses dropout regularization and early stopping to reduce overfitting.
+- Saves the best trained model as amc_model.keras using Keras ModelCheckpoint.
+- Evaluates the trained model using accuracy, precision, recall, F1-score, and support per class.
+- Generates confusion_matrix.png to show class-wise prediction behavior.
+- Generates accuracy_vs_snr.png to analyze model robustness across signal-to-noise ratios.
+- Generates f1_scores_bar_chart.png to compare per-class F1 performance.
+- Includes a prediction script that simulates unseen live signal classification and prints predicted modulation with confidence.
+- Provides TensorFlow Lite export with quantization for edge/embedded deployment.
+- Includes a Streamlit dashboard to trigger training, evaluation, plot viewing, and TFLite export from a simple UI.
+
+Model / ML Approach:
+- Input: 128 time-step I/Q signal samples with 2 channels.
+- Architecture: Conv1D(128) -> BatchNorm -> MaxPool -> Conv1D(128) -> BatchNorm -> MaxPool -> Conv1D(64) -> BatchNorm -> MaxPool -> Flatten -> Dense(256) -> Dropout(0.4) -> Dense(128) -> Dropout(0.3) -> Softmax.
+- Optimizer: Adam with learning rate 0.0005.
+- Loss Function: Categorical cross-entropy.
+- Training Strategy: Up to 50 epochs, batch size 128, validation split 0.1, early stopping patience 8.
+- Reported Result: 94.88% overall test accuracy on 18,000 unseen signals.
+- Strongest Classes: AM-DSB, AM-SSB, BPSK, and QAM16 achieved very high precision/recall in the project report.
+- Hardest Distinction: QPSK vs 8PSK, because both are phase-shift keying modulations with physically similar signal patterns under noise.
+
+Design Principles:
+- Lightweight architecture: uses 1D convolutions instead of heavier 2D/image-based models, making the model suitable for signal time-series data and edge deployment.
+- Practical signal filtering: evaluates on SNR >= 0 dB to focus on realistic signals that are not completely buried in noise.
+- Generalization-focused training: dropout, batch normalization, validation monitoring, and early stopping reduce overfitting.
+- Explainable evaluation: confusion matrix, per-class F1 scores, and accuracy-vs-SNR plots make model behavior easier to interpret.
+- Deployment-aware design: TensorFlow Lite quantization prepares the model for low-resource environments such as embedded devices or microcontrollers.
+- End-to-end ML workflow: includes data loading, preprocessing, training, evaluation, visualization, prediction, export, and UI-based execution.
+
+Build / Run:
+- Install dependencies with: pip install -r requirements.txt
+- Place dataset file in project root: RML2016.10a_dict.pkl
+- Train the model with: python train.py
+- Evaluate the trained model with: python evaluate.py
+- Run a random unseen-signal prediction with: python predict.py
+- Export quantized model with: python export_tflite.py
+- Launch Streamlit dashboard with: streamlit run app.py
+
+Generated Artifacts:
+- amc_model.keras: trained Keras model.
+- confusion_matrix.png: normalized confusion matrix for class-wise analysis.
+- accuracy_vs_snr.png: classification accuracy plotted against SNR.
+- f1_scores_bar_chart.png: per-class F1-score chart.
+- cnn_architecture.png: visual model architecture diagram.
+- implementation_flowchart.png: implementation workflow diagram.
+- amc_model.tflite: quantized TensorFlow Lite model generated after export.
+
+Resume-Ready Points:
+- Built a deep learning-based Automatic Modulation Classification system using TensorFlow/Keras and RadioML 2016.10A I/Q signal data.
+- Designed a lightweight 1D-CNN architecture for classifying six modulation schemes from raw radio signal samples.
+- Achieved a reported 94.88% test accuracy on 18,000 unseen signals using dropout, batch normalization, early stopping, and model checkpointing.
+- Developed evaluation pipelines with confusion matrix, per-class F1-score analysis, and accuracy-vs-SNR robustness visualization.
+- Created a Streamlit interface to run training, evaluation, visualization, and TensorFlow Lite export from one dashboard.
+- Exported the trained Keras model to quantized TensorFlow Lite format for edge/embedded deployment readiness.
