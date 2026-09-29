@@ -1,0 +1,32 @@
+Mintzy Plugin Kelly - ML/Quant Auto-Trading Engine
+
+Project Description:
+Mintzy Plugin Kelly is a Python-based automated intraday trading backend built for running paper and live trading sessions through broker APIs. The system connects to Angel One SmartAPI, consumes ML prediction signals, manages session-based capital allocation, places and monitors orders, tracks live PnL, applies RMS risk controls, and safely exits positions at market close. It is designed as a production-style trading service where API orchestration, worker-process management, broker reconciliation, Redis coordination, MongoDB persistence, and fail-safe exit handling work together.
+
+Tech Stack:
+Python, FastAPI, Uvicorn/Gunicorn, Pydantic, MongoDB/PyMongo, Redis, pandas, NumPy, Angel One SmartAPI, pyotp/TOTP authentication, WebSocket clients, multiprocessing, threading, Docker, CSV logging, and optional ML libraries such as TensorFlow, scikit-learn, TA, yfinance, hmmlearn, and joblib for prediction workflows.
+
+Key Features:
+- FastAPI backend with endpoints for authentication, broker credentials, trading session start/stop, simulation control, live PnL, trade logs, final tradebook downloads, dashboard snapshots, and admin session management.
+- Broker integration with Angel One SmartAPI for login/session restoration, TOTP authentication, token refresh, LTP lookup, order placement, order status polling, orderbook access, holdings, positions, and portfolio data.
+- Automated trading engine that processes ML prediction signals, generates BUY/SELL/HOLD decisions, manages long/short positions, handles position reversals, stop loss exits, and capital exposure logic.
+- Kelly/pyramid-style capital expansion flow for moving profitable paper-trading sessions toward live allocation with updated capital, symbol sizing, and handoff results.
+- Redis-backed session coordination using canonical keys for worker PID, metadata, traded symbols, stop signals, single-symbol exit requests, pyramid results, RMS exit status, and live PnL streams.
+- MongoDB persistence for plugin sessions, saved configurations, trading logs, exited symbols, pyramid PnL records, and final tradebook reporting.
+- Parallel order execution with rate limiting, batch processing, worker threads, position locks, broker cash checks, pending-order tracking, and broker-position reconciliation.
+- Session-safe EOD square-off logic using an engine-attributed position ledger so the system exits only positions opened by the trading session and avoids accidentally closing manual broker positions.
+- Risk-management layer with portfolio-level RMS loss limits, ticker-level exits, stop-loss handling, cash validation, exposure reservation, live PnL monitoring, and fail-safe market-close shutdown behavior.
+- Production deployment support through Docker, Gunicorn with Uvicorn workers, health checks, environment-based configuration, structured runtime logs, and CSV snapshot logging.
+
+Design Principles:
+The project follows a safety-first trading design where broker state is reconciled before high-risk actions, exits are idempotent, Redis keys are centralized, and session ownership is tracked explicitly. API orchestration, broker connectivity, session management, trading logic, EOD utilities, and logging are separated into different modules to keep the system maintainable. The architecture favors observability, fault tolerance, controlled concurrency, and risk-aware automation over simple order execution.
+
+Build / Run Summary:
+The backend can be installed with pip using requirements.txt, configured with MongoDB, Redis, broker credentials, API keys, and risk/session environment variables, then started locally with Uvicorn or deployed with Docker/Gunicorn. A health endpoint is available for container/runtime checks, while Redis and MongoDB are used as core runtime infrastructure.
+
+Resume-Friendly Points:
+- Built a FastAPI-based algorithmic trading backend integrating Angel One SmartAPI, Redis, MongoDB, and ML prediction services.
+- Implemented automated trade execution workflows with order batching, rate limiting, live PnL tracking, broker reconciliation, and session-level worker management.
+- Designed risk-management and EOD safety mechanisms including RMS exits, stop-loss handling, session-owned position ledgers, and fail-safe market-close square-off.
+- Developed Kelly/pyramid-style capital allocation logic for scaling profitable trading sessions from simulation toward live execution.
+- Containerized the service using Docker and Gunicorn/Uvicorn with health checks and environment-driven production configuration.

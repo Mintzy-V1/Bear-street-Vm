@@ -1,0 +1,50 @@
+Project 1: AeroGuide - Offline AI Airport Companion
+Source repo: C:\Users\Hp\Desktop\AI Companion\AI Companion
+
+Overview:
+AeroGuide is an offline-first AI airport assistant built for Skylight International Airport, Surat. It is designed for airport kiosks, web browsers, and voice/text usage, helping travelers ask natural-language questions about flights, gates, food, lounges, airport services, baggage, check-in, transport, and indoor navigation. The assistant maintains session context, remembers details such as flight number and terminal, and can provide proactive passenger alerts through automated phone calls.
+
+Tech Stack:
+- Backend: Python, FastAPI, Uvicorn, Pydantic
+- AI/LLM: Ollama with Llama 3.2 for local inference, Groq-compatible cloud fallback in the LLM client
+- NLU: LLM-based intent classification with rule/keyword fallback
+- Speech: OpenAI Whisper for offline speech-to-text, pyttsx3 for offline text-to-speech
+- Database: SQLite with a large synthetic airport operations dataset
+- Frontend: HTML, CSS, Vanilla JavaScript, REST APIs, WebSocket-style chat support
+- Integrations: Twilio for outbound flight reminder and terminal-change calls
+- Audio/Utilities: sounddevice, soundfile, numpy, python-dotenv, python-multipart
+
+Main Features:
+- Conversational AI assistant for flight status, gates, delays, restaurants, menu items, lounges, check-in, baggage belts, services, parking, transport, and airport navigation.
+- Session-based chat with persistent turn history, conversation memory, and context carryover across messages.
+- Two-layer NLU pipeline: LLM classification first, then robust keyword fallback when the model is unavailable or uncertain.
+- Entity extraction for flight numbers, terminals, gates, brands, food items, facilities, and destinations.
+- SQLite-backed airport knowledge base covering terminals, floors, zones, gates, lounges, restaurants, shops, menu items, airlines, routes, baggage belts, transport nodes, Wi-Fi zones, charging stations, and more.
+- Indoor navigation engine using graph-based shortest path logic with Dijkstra's algorithm, plus GPS/context fallback for user location.
+- Voice interface through a CLI and browser recording flow: microphone input is transcribed, processed by the AI agent, and returned with spoken audio.
+- Web chat interface with message bubbles, typing state, map hints, direction cards, flight registration, and mobile-friendly interaction.
+- User registration flow where travelers enter name, mobile number, and flight number to receive automated departure reminder calls.
+- Background scheduler checks upcoming departures and triggers Twilio calls for registered users.
+- Admin dashboard for viewing registered passengers, call status, flight grouping, and sending terminal-change alert calls.
+
+Design Principles:
+- Offline-first and privacy-aware: core AI, STT, TTS, and airport data can run locally without depending on cloud APIs.
+- Modular architecture: API, agent, NLU, DB, STT, TTS, telephony, and frontend are separated into focused modules.
+- Graceful degradation: keyword fallback and template responses keep the assistant usable even if the LLM is unavailable.
+- Low-friction traveler UX: quick answers, short follow-up prompts, map hints, voice support, and kiosk-friendly UI.
+- Safety-aware response design: urgent cases such as medical help use direct template responses instead of open-ended LLM generation.
+- Operational design: combines passenger assistance with admin-side monitoring and automated calling workflows.
+
+Build / Run:
+- Install dependencies with: pip install -r requirements.txt
+- Initialize database with: python -m db.setup
+- Run local Ollama model with: ollama serve and ollama pull llama3.2
+- Start backend with: uvicorn api.server:app --host 0.0.0.0 --port 8000
+- Open the web app at: http://localhost:8000
+- Run CLI text/voice assistant with: python speech.py --text --loop or python speech.py --loop --duration 5
+
+Resume-Ready Points:
+- Built an offline-first AI airport companion using FastAPI, SQLite, Ollama, Whisper, and pyttsx3 to support text and voice-based traveler assistance.
+- Implemented LLM-powered intent classification with keyword fallback, entity extraction, session memory, and database-grounded response generation.
+- Designed a graph-based indoor navigation module using Dijkstra's algorithm to generate step-by-step airport directions from GPS or session context.
+- Integrated Twilio-based automated departure reminders and terminal-change alerts with a passenger registration and admin monitoring dashboard.

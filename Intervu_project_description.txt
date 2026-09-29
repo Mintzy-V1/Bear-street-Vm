@@ -1,0 +1,65 @@
+Project 2: Intervu - AI-Driven Recruitment Platform
+Source repo: C:\Users\Hp\AI_recruiter\Intervu
+
+Overview:
+Intervu is an AI-powered recruitment and interview platform that supports recruiter-side job creation, candidate invitations, resume parsing, multi-round interviews, online assessments, proctoring, coding evaluation, and candidate analytics. The project is structured as a main Next.js application with a separate TypeScript judge backend for running candidate code, an AI interviewer/persona layer, and an experimental LiveKit agent scaffold for real-time voice interviews. Its modular service boundaries also make it suitable for future MCP server/client integration, where resume search, code judging, scoring, reports, and proctoring logs could be exposed as agent tools.
+
+Tech Stack:
+- Frontend: Next.js App Router, React, TypeScript, Tailwind CSS, shadcn/ui, Radix UI, Lucide React, Framer Motion
+- Backend: Next.js API routes, server-side services/modules, Node.js
+- Database/ORM: PostgreSQL with Prisma
+- Authentication: Clerk
+- AI/RAG: Google Gemini for generation and embeddings, Pinecone vector database for resume-context retrieval
+- Resume Parsing: pdf-parse, local upload storage, chunking, embedding generation
+- Coding Judge: Express.js, TypeScript, Docker/local runtime execution, child_process
+- Supported Judge Languages: Python, C++, JavaScript, TypeScript, Java, Go
+- Infrastructure: Redis/ioredis for rate limiting, BullMQ queue setup for scoring/report jobs
+- Proctoring: Browser APIs, fullscreen checks, visibility events, MediaPipe Face Detection
+- Agent Layer: AIInterviewer model, coach personas, interview memory, adaptive question generation, LiveKit agent scaffold
+- Real-Time/Voice Scaffold: LiveKit agent setup with Google STT, Gemini LLM, and TTS configuration
+- MCP Readiness: modular API/service design that can be extended into MCP server tools and MCP clients for agent-driven workflows
+
+Main Features:
+- Recruiter dashboard for viewing active jobs, candidate metrics, completed assessments, pending invites, and recent job posts.
+- Multi-step job creation flow where recruiters define job details, required skills, round sequence, round weights, and assessment configuration.
+- AI-assisted MCQ generation based on job title, description, and selected topics.
+- Interview pipeline builder supporting rounds such as OA, Technical, HR, DSA, and custom rounds.
+- Invite system with secure random tokens, expiry validation, invite consumption, and automatic interview session creation.
+- Candidate dashboard showing pending invites, interview sessions, readiness stats, resume health, learning roadmap, and application status.
+- Resume upload pipeline that parses PDF resumes, stores original file metadata, chunks extracted text, generates Gemini embeddings, and upserts vectors into Pinecone namespaces.
+- RAG-based AI interview flow that retrieves relevant resume chunks, uses candidate history, tracks transcript/scores, and generates personalized follow-up questions.
+- Interview memory module that tracks covered topics, strengths, weaknesses, confidence trend, question count, and adaptive difficulty.
+- Agent-oriented interview design using AI interviewer personas, model versions, system prompts, memory updates, and role-specific coaching behavior.
+- Experimental voice-agent scaffold with LiveKit Agents, Google STT/TTS, and Gemini LLM configuration for real-time conversational interviews.
+- Online assessment UI with camera/microphone permission checks, fullscreen enforcement, MCQ rendering, progress tracking, and submit flow.
+- Proctoring hooks for tab switching, fullscreen exit, window blur, copy/paste, right-click, no-face detection, and multiple-face detection.
+- Code contest/assessment interface with problem statements, examples, constraints, language selection, timer, run-code action, reset, output panel, and submission state.
+- Code execution API that forwards code to a separate judge service, which writes code/input files into isolated temp directories and runs them through Docker or local runtimes.
+- Judge backend includes execution limits for time, memory, CPU, no-network Docker execution, and language-specific compile/run commands.
+- Recruiter analytics/report modules for job-level applicant counts, in-progress/completed sessions, round-level averages, and detailed interview reports with proctoring events.
+- MCP-ready extension points where platform capabilities like resume retrieval, candidate scoring, job analytics, code execution, and report generation can be wrapped as tool interfaces for external AI agents.
+
+Design Principles:
+- Modular monolith plus service isolation: main product logic lives in the Next.js app, while risky code execution is separated into a dedicated judge backend.
+- Role-based UX: separate recruiter and candidate flows with focused dashboards, invite handling, assessments, reports, and interview progression.
+- AI-grounded personalization: resume chunks are embedded and retrieved through Pinecone so interview questions can be based on candidate-specific experience.
+- Security-first assessment design: proctoring signals, fullscreen enforcement, camera checks, and sandboxed code execution reduce cheating and remote-code risk.
+- Scalable architecture direction: Redis rate limiting and BullMQ queues prepare heavy scoring/reporting tasks for asynchronous processing.
+- Agent-ready design: interview generation, resume retrieval, code judging, proctoring, scoring, and reporting are separated into services so multiple specialized agents can coordinate these workflows.
+- MCP-compatible direction: the existing API/service boundaries can be exposed as MCP server tools and consumed by an MCP client for tool-using AI recruiter agents.
+- Clean product UI: card-based dashboards, guided multi-step job creation, assessment layouts, and proctored full-screen testing experience.
+
+Build / Run:
+- Main app: cd pdf_reader, npm install, configure environment variables for DATABASE_URL, Clerk, Gemini, Pinecone, Redis, then run npx prisma generate and npm run dev.
+- Database: use Prisma migrations in pdf_reader/prisma/migrations against PostgreSQL.
+- Judge backend: cd judge_backend, npm install, npm run dev. Runs on port 4000 and exposes POST /run.
+- For Docker-based judging, build language runner images from judge_backend/docker and keep Docker running. If Docker is unavailable, the executor falls back to local language runtimes where installed.
+
+Resume-Ready Points:
+- Built an AI recruitment platform using Next.js, TypeScript, Prisma, PostgreSQL, Clerk, Gemini, and Pinecone to automate candidate screening and interviews.
+- Implemented resume parsing and RAG pipeline with PDF extraction, text chunking, Gemini embeddings, and Pinecone vector search for personalized interview questions.
+- Designed recruiter/candidate workflows including job creation, interview pipelines, invite tokens, candidate dashboards, online assessments, and interview reports.
+- Designed an agent-oriented interview layer with AI interviewer personas, adaptive memory, role-specific prompting, and a LiveKit voice-agent scaffold for conversational interview automation.
+- Structured the system with MCP-ready service boundaries so resume retrieval, code execution, scoring, analytics, and report generation can be exposed as tools to external agent clients.
+- Developed a separate TypeScript/Express judge service for running multi-language coding submissions with runtime limits and Docker/local execution support.
+- Added browser-based proctoring with fullscreen checks, tab/window activity logging, copy/paste prevention signals, and MediaPipe face detection.

@@ -894,15 +894,23 @@ class BrokerConnector:
         try:
             data = self._load_scripmaster(exchange)
             sym_upper = tradingsymbol.upper().replace("-EQ", "")
+            if sym_upper == "LTIM":
+                sym_upper = "LTM"
             if isinstance(data, list):
                 for item in data:
-                    if (item.get("sym") or "").upper() == sym_upper:
+                    raw = (item.get("sym") or "").upper().replace("-EQ", "")
+                    if raw == "LTIM":
+                        raw = "LTM"
+                    if raw == sym_upper:
                         token = item.get("code") or item.get("scrip_token") or item.get("token")
                         if token is not None:
                             return str(token)
             elif isinstance(data, dict):
                 for k, v in data.items():
-                    if k.upper() == sym_upper:
+                    raw = k.upper().replace("-EQ", "")
+                    if raw == "LTIM":
+                        raw = "LTM"
+                    if raw == sym_upper:
                         if isinstance(v, dict):
                             return str(v.get("code") or v.get("scrip_token") or v.get("token") or "")
                         return str(v)
@@ -919,15 +927,23 @@ class BrokerConnector:
         try:
             data = self._load_scripmaster(exchange)
             sym_upper = tradingsymbol.upper().replace("-EQ", "")
+            if sym_upper == "LTIM":
+                sym_upper = "LTM"
             tick = None
             if isinstance(data, list):
                 for item in data:
-                    if (item.get("sym") or "").upper() == sym_upper:
+                    raw = (item.get("sym") or "").upper().replace("-EQ", "")
+                    if raw == "LTIM":
+                        raw = "LTM"
+                    if raw == sym_upper:
                         tick = item.get("tick")
                         break
             elif isinstance(data, dict):
                 for k, v in data.items():
-                    if k.upper() == sym_upper:
+                    raw = k.upper().replace("-EQ", "")
+                    if raw == "LTIM":
+                        raw = "LTM"
+                    if raw == sym_upper:
                         if isinstance(v, dict):
                             tick = v.get("tick")
                         break

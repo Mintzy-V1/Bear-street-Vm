@@ -1,0 +1,141 @@
+Mintzy Session Hardening Pack (MSHP-2026) — Change Summary
+==========================================================
+Repo: mintzy-bear-street
+Purpose: Short reference for porting these fixes to another plugin/trading repo.
+
+
+1) 3:00 PM AUTO-EXIT — ENGINE vs MANUAL POSITIONS
+---------------------------------------------------
+Problem:
+  At 15:00 IST, EOD square-off was exiting the full broker net position on a symbol.
+  If the user manually bought/sold extra qty outside the engine, that manual qty was
+  also getting closed at market close.
+
+What we did:
+  - Track an engine-only session ledger (_session_open_qty) updated only on confirmed
+    engine fills (not from broker position sync).
+  - Record engine order_ids in Redis (session_order_ids:{session_id}).
+  - Record session-traded symbols in Redis (session_symbols_traded:{session_id}).
+  - At EOD, build an exit plan from ledger qty ∩ broker qty — skip symbols where
+    broker has qty but ledger=0 (manual/other qty on a session symbol).
+  - Exit qty = min(abs(ledger_qty), broker_qty) so we never over-sell engine attribution.
+
+Key env flags:
+  EXIT_ONLY_SESSION_SYMBOLS=true   (default)
+  EOD_USE_SESSION_LEDGER=true      (default)
+
+Files changed:
+  - utils/session_ledger.py       (NEW / core logic)
+  - utils/eod_exit.py             (NEW / EOD idempotency + plan wrapper)
+  - utils/session_symbols.py      (NEW / Redis allow-list for session symbols)
+  - utils/redis_keys.py           (session meta / order id / symbols keys)
+  - auto_trader_exposure_expansion.py
+
+Main functions:
+  Trader side (fills → ledger):
+    - AutoTrader._track_engine_fill()
+    - record_engine_order_for_trader()          → utils/session_ledger.py
+    - apply_fill_to_session_ledger()            → utils/session_ledger.py
+
+  EOD planning (15:00):
+    - AutoTrader._trigger_market_close_exit()
+    - AutoTrader._exit_all_positions_and_stop()
+    - AutoTrader._run_eod_exit_body()
+    - try_begin_eod_exit()                        → utils/eod_exit.py
+    - prepare_eod_exit_plan()                     → utils/eod_exit.py
+    - build_eod_exit_plan()                       → utils/session_ledger.py
+    - resolve_session_allow_list()                → utils/session_ledger.py
+
+  Watchdog / scheduler:
+    - AutoTrader._auto_exit_watchdog_loop()       (fires 15:00 even if main loop sleeps)
+    - AutoTrader._sleep_until_next_candle()       (won't sleep past 15:00)
+
+  Manual single-symbol exits (separate from EOD):
+    - AutoTrader.exit_single_position()
+    - AutoTrader._persist_symbol_exit()           → Mongo exited_symbols
+    - _exited_symbols set                         (skip in future cycles, not EOD ledger)
+
+Log markers to grep:
+  [EOD-PLAN] [EOD-SKIP] [SESSION-LEDGER] [AUTO-EXIT]
+
+
+2) GUNICORN WORKER TIMEOUT — prepare_for_live_start / worker terminate
+--------------------------------------------------------------------
+Problem:
+  Paper → live handoff called blocking worker kill/wait inside the FastAPI/gunicorn
+  request thread. If the old simulation worker took too long to die, the HTTP worker
+  hit gunicorn timeout and crashed (503 / worker restart).
+
+What we did:
+  - Run prepare_for_live_start() in a threadpool from the API handler (non-blocking
+    for the event loop).
+  - Centralize force-kill in _terminate_session_worker() with bounded wait
+    (WORKER_FORCE_KILL_WAIT_SECONDS, default 10s).
+  - Reconcile stale Redis PID / local registry before kill (_reconcile_session_registry).
+  - Never kill a live (non-paper) worker — return LIVE_ALREADY_RUNNING for idempotent
+    live starts.
+  - Async stop-simulation path (stop_simulation_session_async) so stop doesn't block
+    gunicorn either (?wait=true keeps legacy blocking mode).
+
+Files changed:
+  - session_manager.py
+  - api_server.py
+
+Main functions:
+  - SessionManager.prepare_for_live_start()       (paper clear before live spawn)
+  - SessionManager._terminate_session_worker()    (SIGKILL + registry cleanup)
+  - SessionManager.ensure_worker_stopped()        (force-clear paper/zombie workers)
+  - SessionManager._reconcile_session_registry()
+  - SessionManager.stop_simulation_session_async()
+  - SessionManager.stop_simulation_session()      (blocking / ?wait=true)
+  - api_server start_trading handler                (run_in_threadpool prepare_for_live_start)
+  - api_server stop_trading_simulation()            (async stop default)
+
+Log markers:
+  [SessionManager] prepare_for_live_start
+  [SessionManager] _terminate_session_worker
+  [START-TRADING-DEBUG]
+
+
+3) SESSION LEDGER — FLIP TO LONG / SHORT QUANTITY FIX
+-----------------------------------------------------
+Problem:
+  On FLIP_TO_LONG / FLIP_TO_SHORT, the session ledger was updating qty incorrectly.
+  Flip orders close the old side and open the reverse; fill qty is often 2× open qty.
+  Simple +/- fill math left the ledger wrong, which broke EOD exit qty at 15:00.
+
+What we did:
+  - _compute_ledger_qty_after_fill() encodes flip math:
+      FLIP_TO_SHORT: close long → net short (handles fill >= 2 * prior_long)
+      FLIP_TO_LONG:  close short → net long  (handles fill >= 2 * prior_short)
+  - Paper position path uses qty // 2 for the new flipped open leg after closing
+    the old side (_update_paper_positions_on_fill).
+
+Files changed:
+  - utils/session_ledger.py
+  - auto_trader_exposure_expansion.py
+
+Main functions:
+  - _compute_ledger_qty_after_fill()              → utils/session_ledger.py
+  - apply_fill_to_session_ledger()                → utils/session_ledger.py
+  - AutoTrader._update_paper_positions_on_fill()  (paper flip: close leg + qty//2 open)
+  - AutoTrader._track_engine_fill()               (calls ledger on broker fill)
+
+Log markers:
+  [SESSION-LEDGER] [FLIP-PAPER]
+
+
+HOW TO ASK FOR THIS IN ANOTHER REPO
+-----------------------------------
+Say:
+
+  "Implement MSHP-2026 from mintzy-bear-street:
+   (1) session-scoped 3PM EOD exit — engine ledger vs manual qty
+   (2) gunicorn-safe prepare_for_live_start + _terminate_session_worker
+   (3) flip ledger qty fix in _compute_ledger_qty_after_fill"
+
+Reference files (copy/port in this order):
+  1. utils/session_ledger.py, utils/eod_exit.py, utils/session_symbols.py, utils/redis_keys.py
+  2. session_manager.py (prepare_for_live_start block + async stop)
+  3. api_server.py (run_in_threadpool + stop-simulation async)
+  4. auto_trader_exposure_expansion.py (_run_eod_exit_body, _track_engine_fill, flip paper path)
