@@ -4988,6 +4988,12 @@ class AutoTrader:
                 print("time after analyse after second broker api call : ", time.time()- t_after_brp_call)
                 self.tlog.record("time after analyse after second broker api call" ,t_after_brp_call , note="time analysis of delay")
 
+                symbols, symbol_batches, stop_all = self._apply_stoplock_after_cycle(
+                    symbols, batch_size
+                )
+                if stop_all:
+                    break
+
                 if now_time >= cutoff_time:
                     self.alerts.notify("Backup market close triggered (14:50 IST)")
                     print("\n" + "=" * 70)
