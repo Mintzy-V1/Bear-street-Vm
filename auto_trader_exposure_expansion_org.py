@@ -102,7 +102,6 @@ class TimingLogger:
 MARKET_TZ = timezone(timedelta(hours=5, minutes=30))
 AUTO_EXIT_TIME = dt_time(14, 50)          # 2:50 PM IST
 AUTO_EXIT_WARNING_TIME = dt_time(14, 45) # 5 min before flatten
-STOP_LOCK_TIME = dt_time(14, 15)         # 14:15 IST — exit losers, continue with greens
 
 # TEMP TEST: when set, trading uses this cash cap instead of full broker RMS.
 # Default 500000. Set env PYRAMID_FREE_CASH_OVERRIDE=none to use real RMS again.
@@ -581,7 +580,6 @@ class AutoTrader:
         self.positions_lock = threading.Lock()   #  ADD THIS LINE
         self._exited_symbols = set()  # Symbols manually exited Ã¢â‚¬â€ excluded from future cycles
         self._exited_symbols_index_ready = False
-        self._stoplock_done = False
 
         # ==================== RMS: RISK MANAGEMENT SYSTEM ====================
         self.rms_triggered = False          # True once daily loss limit is hit
@@ -3508,79 +3506,6 @@ class AutoTrader:
                         return float(self._calculate_pnl(symbol, ltp))
         return 0.0
 
-    def _run_stoplock_exits(self, active_symbols: list) -> None:
-        """At 14:15 IST exit open symbols with unrealized_pnl < 0; continue with the rest."""
-        now = self._now_market_time()
-        print(
-            f"[STOPLOCK] Check at {now.strftime('%Y-%m-%d %H:%M:%S')} IST "
-            f"(trigger>={STOP_LOCK_TIME.strftime('%H:%M')})"
-        )
-
-        symbols_to_check = {
-            self._normalize_config_symbol(s) for s in (active_symbols or []) if s
-        }
-
-        with self.broker_pos_lock:
-            self._broker_positions_cache = self._get_broker_positions()
-            for pos in self._broker_positions_cache or []:
-                sym = self._normalize_config_symbol(pos.get("symbol"))
-                if sym:
-                    symbols_to_check.add(sym)
-
-        exited = []
-        continuing = []
-        for sym_key in sorted(symbols_to_check):
-            if sym_key in self._exited_symbols:
-                continue
-
-            qty = self._get_symbol_position_qty(sym_key)
-            if qty == 0:
-                continuing.append(f"{sym_key}(flat)")
-                continue
-
-            unrealized = self._get_symbol_unrealized_pnl(sym_key)
-            if unrealized < 0:
-                print(f"[STOPLOCK] {sym_key} unrealized={unrealized:.2f} — placing exit")
-                result = self.exit_single_position(sym_key, log_signal="STOP_LOCK")
-                if result.get("success"):
-                    exited.append(sym_key)
-                else:
-                    print(
-                        f"[STOPLOCK] {sym_key} exit failed: "
-                        f"{result.get('message', 'unknown error')}"
-                    )
-            else:
-                continuing.append(f"{sym_key}(unrealized={unrealized:.2f})")
-
-        summary = (
-            f"14:15 stop-lock complete — exited: {exited or 'none'}; "
-            f"continuing: {continuing}"
-        )
-        print(f"[STOPLOCK] {summary}")
-        self.alerts.notify(summary)
-
-    def _apply_stoplock_after_cycle(self, symbols: list, batch_size: int):
-        """
-        Once per day after a prediction cycle (14:16 75m wake): exit losers, strip symbols.
-        Returns (symbols, symbol_batches, stop_trader).
-        """
-        if self._stoplock_done:
-            batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)]
-            return symbols, batches, False
-
-        if self._now_market_time().time() < STOP_LOCK_TIME:
-            batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)]
-            return symbols, batches, False
-
-        self._run_stoplock_exits(symbols)
-        self._stoplock_done = True
-        symbols, symbol_batches = self._strip_exited_from_active(symbols, batch_size)
-        if not symbols:
-            print("[AUTO_TRADER] All symbols exited at stop-lock — stopping.")
-            self.stop_event.set()
-            return symbols, symbol_batches, True
-        return symbols, symbol_batches, False
-
     def convert_candle_to_seconds(self, c):
         c = str(c).lower().strip()
 
@@ -4112,12 +4037,6 @@ class AutoTrader:
                     self.alerts.notify("No valid prediction data returned; retrying next cycle...")
                     print("calling sleep_until_next_candle")
                     self.tlog.record("PREDICTION_BATCH_TOTAL", t_pred_start, note="EMPTY_RESULT")
-
-                    symbols, symbol_batches, stop_all = self._apply_stoplock_after_cycle(
-                        symbols, batch_size
-                    )
-                    if stop_all:
-                        break
                     self._sleep_until_next_candle(candle)
                     continue
 
